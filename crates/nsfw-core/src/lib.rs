@@ -7,3 +7,5 @@ pub mod legacy_mapping;
 pub use legacy_mapping::*;
 pub mod aggregation;
 pub use aggregation::*;
+pub mod models;
+pub use models::*;
