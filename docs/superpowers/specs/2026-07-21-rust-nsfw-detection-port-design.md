@@ -416,12 +416,14 @@ No in-service shadow-mode subsystem (Python's `plan.md` Phase 7 shadow-mode desi
 
 ## 18. Phased Implementation Order
 
-Matches the source `plan.md`'s phase discipline (unit tests + a phase integration test + negative-path tests + a short completion note per phase), adapted to the workspace structure:
+Matches the source `plan.md`'s phase discipline (unit tests + a phase integration test + negative-path tests + a short completion note per phase), adapted to the workspace structure.
+
+**Reordered from the original numbering** (data layer moved from position 3 to position 4): the data layer phase has a real external gate — reconciling Postgres/ClickHouse migrations against the live schema (§13.1/§13.2) and confirming the KVRocks deployment mode (§13.3) both require someone with production DB/infra access, which wasn't available when this phase was reached. Stateless endpoints (§9.2's `/v1/images/*`/`/v1/text/detect`, explicitly "no persistence") have zero dependency on repositories, so they were pulled forward to keep making progress without blocking on infra access. The data layer's three gates don't go away — they're still required before Phase 5 (video enqueue/status), which is the first phase that actually needs KVRocks.
 
 1. **Workspace skeleton** — `core` crate (domain models, error types, moderation policy, legacy mapping, model-output parsing — all pure, no I/O), static `Settings` loader, CI (`fmt`/`clippy`/`build`/`test`).
 2. **API skeleton** — axum app, `/health`/`/ready` against fakes, HMAC middleware, OpenAPI scaffold, error envelope wired through `IntoResponse`.
-3. **Data layer** — Postgres migrations (§13.1, reconciled against live schema), ClickHouse DDL incl. new `excluded_videos` and the 39-vs-45-column reconciliation (§13.2), KVRocks key scheme, repository traits + real impls + in-memory fakes (§13.4). **Gate**: confirm actual KVRocks deployment mode (single-node vs. cluster) before this phase closes — it decides the §13.3 `redis` vs. `fred` crate choice, which the queue repository implementation depends on.
-4. **Stateless endpoints** — GPU client (§12), `/v1/images/detect-url`, `/v1/images/detect-base64`, `/v1/text/detect`, no persistence.
+3. **Stateless endpoints** — GPU client (§12), `/v1/images/detect-url`, `/v1/images/detect-base64`, `/v1/text/detect`, no persistence.
+4. **Data layer** — Postgres migrations (§13.1, reconciled against live schema), ClickHouse DDL incl. new `excluded_videos` and the 39-vs-45-column reconciliation (§13.2), KVRocks key scheme, repository traits + real impls + in-memory fakes (§13.4). **Gate**: confirm actual KVRocks deployment mode (single-node vs. cluster) before this phase closes — it decides the §13.3 `redis` vs. `fred` crate choice, which the queue repository implementation depends on. **This gate must be resolved before Phase 5 starts.**
 5. **Video enqueue/status** — `QueueService`, idempotency rules, `POST /v1/videos/detect`, `GET /v1/videos/{video_id}/status`.
 6. **Video worker pipeline** — full `video-worker` binary (§10), including the worker-concurrency and concurrent-frame-batch-dispatch improvements (§6.1, §6.2).
 7. **Flush worker + manual ban** — `flush-worker` binary as a continuous loop (§11), `POST /v1/videos/{video_id}/ban` (§9.3).
