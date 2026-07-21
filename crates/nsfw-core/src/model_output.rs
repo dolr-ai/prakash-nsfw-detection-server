@@ -1,4 +1,5 @@
 use crate::moderation::{MODERATION_CATEGORIES, compute_is_nsfw};
+use serde::Serialize;
 use std::collections::HashMap;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -9,7 +10,13 @@ pub enum ModelOutputError {
     InvalidSchema,
 }
 
-#[derive(Debug, Clone)]
+/// `Serialize` is derived here (not just used internally) because this struct doubles
+/// as the exact wire response for the stateless `/v1/images/*` and `/v1/text/detect`
+/// endpoints (spec §9.2's `ModerationDetectResponse`) -- its fields already match that
+/// wire contract 1:1, and its `parse()` constructor already guarantees the
+/// self-consistency Python's `ModerationDetectResponse.validate_policy_fields` checks
+/// separately, so no redundant response DTO/validator is needed in the API layer.
+#[derive(Debug, Clone, Serialize)]
 pub struct ModerationModelOutput {
     pub top_category: String,
     pub categories: HashMap<String, u8>,
