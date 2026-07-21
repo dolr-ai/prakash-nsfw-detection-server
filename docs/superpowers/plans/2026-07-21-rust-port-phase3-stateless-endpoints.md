@@ -727,10 +727,14 @@ impl ImageDetectionService {
     }
 
     pub async fn detect_base64(&self, image_base64: &str, prompt: Option<&str>) -> Result<ModerationModelOutput, ApiError> {
-        let gpu_service = self.require_gpu_service()?;
+        // Decode BEFORE the gpu-configured check, matching Python's ordering exactly:
+        // `detect_base64` decodes first and only reaches the gpu check inside
+        // `_detect_image_bytes`. Checking gpu first would return 503 gpu_not_configured
+        // where Python returns 400 invalid_image_base64 for a malformed body.
         let image_bytes = base64::engine::general_purpose::STANDARD.decode(image_base64).map_err(|_| {
             ApiError::from(AppError::new(ErrorCode::InvalidImageBase64, "image_base64 must be valid base64"))
         })?;
+        let gpu_service = self.require_gpu_service()?;
         self.detect_image_bytes(gpu_service, image_bytes, prompt).await
     }
 
@@ -912,18 +916,23 @@ git commit -m "feat: add TextDetectionService"
 
 The response type is `ModerationModelOutput` directly (Serialize was added in Task 1) — no separate response DTO, since its fields and `parse()`-guaranteed self-consistency already match Python's `ModerationDetectResponse`.
 
+**Two request-validation concerns these handlers must cover** (these are the port's first body-carrying routes, so this lands here, not later):
+1. Python's pydantic schemas put `min_length=1` on `image_url`, `image_base64`, and `text` (audit §2). A plain `String` field drops that, so `{"text": ""}` would reach a real GPU call instead of Python's 422. `require_non_empty` restores it.
+2. Axum's default `Json` extractor rejection emits **plain text**, bypassing the `{"error":{"code","message"}}` envelope entirely — and returns 400 (not 422) for malformed JSON. Taking `Result<Json<T>, JsonRejection>` and mapping it lets every schema failure come back as `validation_error`/422 in the standard envelope, matching spec §7.3.
+
 - [ ] **Step 1: Create `moderation_routes.rs`**
 
 ```rust
+use axum::extract::rejection::JsonRejection;
 use axum::extract::State;
 use axum::Json;
+use nsfw_core::{AppError, ErrorCode, ModerationModelOutput};
 use serde::Deserialize;
 use std::sync::Arc;
 
 use crate::error::ApiError;
 use crate::image_detection::ImageDetectionService;
 use crate::text_detection::TextDetectionService;
-use nsfw_core::ModerationModelOutput;
 
 #[derive(Deserialize)]
 pub struct ImageUrlDetectRequest {
@@ -942,24 +951,51 @@ pub struct TextDetectRequest {
     pub text: String,
 }
 
+/// Mirrors Python's pydantic `min_length=1` on the request fields: a blank/whitespace
+/// value is a 422 `validation_error`, not a real GPU call.
+fn require_non_empty(value: &str, field: &str) -> Result<(), ApiError> {
+    if value.trim().is_empty() {
+        return Err(ApiError::from(AppError::new(
+            ErrorCode::ValidationError,
+            format!("{field} must not be empty"),
+        )));
+    }
+    Ok(())
+}
+
+/// Converts axum's own JSON extractor rejection (malformed body, missing field, wrong
+/// type) into the service's standard error envelope. Without this, axum emits a
+/// plain-text 400/422 that bypasses `{"error":{"code","message"}}` entirely.
+fn json_or_validation_error<T>(result: Result<Json<T>, JsonRejection>) -> Result<T, ApiError> {
+    result.map(|Json(value)| value).map_err(|rejection| {
+        ApiError::from(AppError::new(ErrorCode::ValidationError, rejection.body_text()))
+    })
+}
+
 pub async fn detect_image_url(
     State(service): State<Arc<ImageDetectionService>>,
-    Json(request): Json<ImageUrlDetectRequest>,
+    request: Result<Json<ImageUrlDetectRequest>, JsonRejection>,
 ) -> Result<Json<ModerationModelOutput>, ApiError> {
+    let request = json_or_validation_error(request)?;
+    require_non_empty(&request.image_url, "image_url")?;
     Ok(Json(service.detect_url(&request.image_url, request.prompt.as_deref()).await?))
 }
 
 pub async fn detect_image_base64(
     State(service): State<Arc<ImageDetectionService>>,
-    Json(request): Json<ImageBase64DetectRequest>,
+    request: Result<Json<ImageBase64DetectRequest>, JsonRejection>,
 ) -> Result<Json<ModerationModelOutput>, ApiError> {
+    let request = json_or_validation_error(request)?;
+    require_non_empty(&request.image_base64, "image_base64")?;
     Ok(Json(service.detect_base64(&request.image_base64, request.prompt.as_deref()).await?))
 }
 
 pub async fn detect_text(
     State(service): State<Arc<TextDetectionService>>,
-    Json(request): Json<TextDetectRequest>,
+    request: Result<Json<TextDetectRequest>, JsonRejection>,
 ) -> Result<Json<ModerationModelOutput>, ApiError> {
+    let request = json_or_validation_error(request)?;
+    require_non_empty(&request.text, "text")?;
     Ok(Json(service.detect(&request.text).await?))
 }
 ```
@@ -1145,6 +1181,62 @@ async fn detect_image_base64_accepts_valid_image_and_returns_moderation_response
 }
 
 #[tokio::test]
+async fn empty_text_is_a_validation_error_not_a_gpu_call() {
+    // Python's pydantic `min_length=1` equivalent -- must 422 before any GPU call.
+    let gpu_server = MockServer::start().await;
+    let app = build_app(&gpu_server.uri(), "test-secret").await;
+    let body = serde_json::to_vec(&json!({"text": "   "})).unwrap();
+    let (timestamp, signature) = sign("test-secret", "POST", "/v1/text/detect", &body);
+    let response = app.oneshot(
+        Request::builder().method("POST").uri("/v1/text/detect")
+            .header("content-type", "application/json")
+            .header(TIMESTAMP_HEADER, timestamp).header(SIGNATURE_HEADER, signature)
+            .body(Body::from(body)).unwrap(),
+    ).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["error"]["code"], "validation_error");
+}
+
+#[tokio::test]
+async fn malformed_json_body_uses_the_error_envelope() {
+    // Axum's default Json rejection would emit plain-text 400; must be 422 in-envelope.
+    let gpu_server = MockServer::start().await;
+    let app = build_app(&gpu_server.uri(), "test-secret").await;
+    let body = b"{not json".to_vec();
+    let (timestamp, signature) = sign("test-secret", "POST", "/v1/text/detect", &body);
+    let response = app.oneshot(
+        Request::builder().method("POST").uri("/v1/text/detect")
+            .header("content-type", "application/json")
+            .header(TIMESTAMP_HEADER, timestamp).header(SIGNATURE_HEADER, signature)
+            .body(Body::from(body)).unwrap(),
+    ).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["error"]["code"], "validation_error");
+}
+
+#[tokio::test]
+async fn missing_required_field_uses_the_error_envelope() {
+    let gpu_server = MockServer::start().await;
+    let app = build_app(&gpu_server.uri(), "test-secret").await;
+    let body = serde_json::to_vec(&json!({})).unwrap();
+    let (timestamp, signature) = sign("test-secret", "POST", "/v1/text/detect", &body);
+    let response = app.oneshot(
+        Request::builder().method("POST").uri("/v1/text/detect")
+            .header("content-type", "application/json")
+            .header(TIMESTAMP_HEADER, timestamp).header(SIGNATURE_HEADER, signature)
+            .body(Body::from(body)).unwrap(),
+    ).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["error"]["code"], "validation_error");
+}
+
+#[tokio::test]
 async fn gpu_not_configured_returns_503() {
     let mut vars = HashMap::new();
     vars.insert("INTERNAL_REQUEST_HMAC_SECRET".to_string(), "test-secret".to_string());
@@ -1279,7 +1371,7 @@ async fn fallback_404() -> axum::response::Response {
 - [ ] **Step 5: Run to verify the tests pass**
 
 Run: `cargo test -p nsfw-api --test moderation_routes_test`
-Expected: PASS (5 tests).
+Expected: PASS (8 tests).
 
 - [ ] **Step 6: Manual smoke test** (optional but recommended, needs a real GPU endpoint or leave GPU unset to see the 503 path)
 
@@ -1309,13 +1401,18 @@ Run: `cargo fmt --all -- --check` (run `cargo fmt --all` first if it fails)
 Run: `cargo clippy --workspace --all-targets -- -D warnings`
 Run: `cargo test --workspace`
 
-Expected: all clean. Workspace total 115 tests (Phase 2's 103 + 3 GPU client + 4 GPU moderation service + 5 route integration tests + 1 new nested-path auth test − 1: the auth crate goes from 4 to 5, moderation adds 5, clients 3, services 4).
+Expected: all clean. Workspace total **119** tests: Phase 2's 103, plus 3 (GPU client) + 4 (GPU moderation service) + 8 (route integration tests, incl. the 3 validation tests) + 1 (nested-path auth regression test, taking auth from 4 to 5).
 
 - [ ] **Step 2: Completion note**
 
 - Commands run: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
 - Delivered: `nsfw-clients` (GPU client), `nsfw-services` (GPU moderation service, shared semaphore + jittered retry), the three stateless endpoints wired under HMAC-gated `/v1`, and the `OriginalUri` auth fix.
-- Known gaps carried forward on purpose: no Sentry breadcrumbs yet (Python emits them per failed GPU/download attempt — deferred to a later observability pass, not required for functional parity). `/ready`'s postgres/kvrocks/clickhouse/ffmpeg/ffprobe checks are still hardcoded `false`; the `gpu` check is now real (`is_gpu_configured`). The image-download-retry and GPU-retry `sleep_before_retry` helpers are near-duplicates across `image_detection.rs` and `gpu_moderation.rs` — acceptable now, but a candidate to hoist into a shared `nsfw-core` or `nsfw-services` retry util once the third site (KVRocks pool retry, spec §6.3) lands in Phase 5.
+- Known gaps carried forward on purpose:
+  - No Sentry breadcrumbs yet (Python emits them per failed GPU/download attempt, and redacts the image URL via `_safe_url_context` per spec §12) — deferred to a later observability pass; not required for functional parity.
+  - `/ready`'s postgres/kvrocks/clickhouse/ffmpeg/ffprobe checks are still hardcoded `false`; the `gpu` check is now real (`is_gpu_configured`).
+  - The three new handlers carry no `#[utoipa::path]` annotation and `ApiDoc` still lists only `health::health`, so `/openapi.json` won't document them (same as Phase 2 left `/ready` undocumented). Worth a dedicated OpenAPI-completeness pass rather than piecemeal annotation.
+  - The `sleep_before_retry` helper is duplicated between `image_detection.rs` and `gpu_moderation.rs` — acceptable at two sites, but hoist it into a shared retry util when the third site (KVRocks pool retry, spec §6.3's "applied identically at all three sites") lands in Phase 5.
+  - The GPU service holds its semaphore permit across both the HTTP call and the JSON parse, where Python releases it before parsing. Functionally harmless (parse is fast, the cap still holds) but marginally reduces effective concurrency vs. Python; revisit only if GPU throughput measurably suffers.
 
 - [ ] **Step 3: Final commit (if fmt fixes were needed)**
 
