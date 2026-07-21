@@ -9,9 +9,9 @@ Target repo: `/Users/prk-jr/Desktop/work/dolr/prakash-nsfw-detection-server` (th
 Port the existing Python NSFW detection service to Rust. The Python service is itself a from-scratch rewrite (see its own `plan.md`) of an older gRPC pipeline into a FastAPI REST API plus two background worker processes. This spec targets a full port of that current (REST + workers) system — not the legacy gRPC code, which stays retired.
 
 Goals:
-- Byte-for-byte wire and business-rule parity with the current Python service, **except** for two categories of deliberate change: (a) a real fix for the one operational gap this spec fully resolves — the ClickHouse flush worker's missing scheduling loop (§11) — and (b) explicit, called-out performance improvements that Rust's concurrency model makes cheap (see §6).
+- Byte-for-byte wire and business-rule parity with the current Python service, **except** for three categories of deliberate change: (a) a real fix for the one operational gap this spec fully resolves — the ClickHouse flush worker's missing scheduling loop (§11); (b) explicit, called-out performance improvements that Rust's concurrency model makes cheap (§6); and (c) closing the `excluded_videos` ClickHouse DDL gap (§13.2), a genuinely missing table rather than a behavior change. This list is exhaustive — anything not in (a)/(b)/(c) below should match Python exactly, including its quirks (§5).
 - Preserve every legacy-compatibility contract: `yral.video_nsfw_agg` old-schema table, `offchain:video_nsfw:{video_id}` KVRocks runtime key, the `/v1/videos/{video_id}/status` read path — downstream readers of these must not need to change.
-- Close one real gap the source audit found that has zero current implementation: the `excluded_videos` ClickHouse table has no DDL anywhere (§13.2). A second gap — neither background worker has a deployment definition anywhere in the source repo — is surfaced and flagged (§15, §17 item 1) but its resolution (which supervision mechanism to use) is explicitly deferred, not decided, by this spec.
+- A second gap found in the source — neither background worker has a deployment definition anywhere in the source repo — is surfaced and flagged (§15, §17 item 1) but its resolution (which supervision mechanism to use) is explicitly deferred, not decided, by this spec.
 
 Non-goals:
 - Porting `app/legacy/` (old gRPC server, GCS/BigQuery pipeline, local ML classifiers). Explicitly out of scope, same as it was for the Python rewrite.
@@ -71,7 +71,9 @@ Dependency direction, same discipline as the Python service: `routes -> services
 Per explicit decision: **exact parity on business behavior, real fixes on operational gaps that have no working implementation today.**
 
 Concretely:
-- **Preserved exactly** (even where it looks like a bug): manual-ban endpoint accepting-but-discarding most request fields (§10.4); the hardcoded `"explicit"`/`"VERY_UNLIKELY"`/`"banned"` values on manual ban; the `service_unavailable` error code being reused for genuinely unhandled exceptions; the KVRocks video-id lookup key's stale-pointer behavior on resubmission (§13.3); the dual independent `attempts` counters between KVRocks and Postgres (§10.3); Python's `CATEGORY_BLOCK_THRESHOLDS` table taking precedence over `plan.md`'s prose rule (§6.1) — **this is the single most consequential parity requirement in this spec.**
+- **Preserved exactly** (even where it looks like a bug): manual-ban endpoint accepting-but-discarding most request fields (§10.4); the hardcoded `"explicit"`/`"VERY_UNLIKELY"`/`"banned"` values on manual ban; the `service_unavailable` error code being reused for genuinely unhandled exceptions; the KVRocks video-id lookup key's stale-pointer behavior on resubmission (§13.3); the dual independent `attempts` counters between KVRocks and Postgres (§10.3); the `FAILED_RETRYABLE` re-enqueue gap (below); Python's `CATEGORY_BLOCK_THRESHOLDS` table taking precedence over `plan.md`'s prose rule (§6.1) — **this is the single most consequential parity requirement in this spec.**
+
+  **`FAILED_RETRYABLE` re-enqueue quirk**: `enqueue_video_job`'s idempotency check looks up an existing job by the unique key `(video_id, source_object_version, policy_version)`. If a job is found and its status is `Queued`, `Processing`, or any of `TERMINAL_VIDEO_STATUSES` (`Classified`, `FailedTerminal`, `Superseded`), enqueue short-circuits and returns the existing job unchanged. `FailedRetryable` is the one status **not** in that checked set — a job stuck in `FailedRetryable` under the same unique key falls through and gets a **new** job/job_id on resubmission, rather than being returned as-is or having its retry accelerated. This looks like an oversight in the original status-set construction, not an intentional design, but per the parity decision above it is preserved as-is: the Rust `enqueue_video_job` implementation must replicate this exact "all statuses except `FailedRetryable`" short-circuit set, not a more sensible "any existing job at this key blocks re-enqueue" rule.
 - **Fixed, because there's nothing working to be compatible with**: ClickHouse flush worker becomes a real continuous loop instead of a one-shot process nothing ever re-invokes (§11); `excluded_videos` gets an actual `CREATE TABLE` (§13.2) since none exists anywhere in the source repo.
 - **Deliberate performance improvements, called out as behavior changes**: §6.
 
@@ -225,6 +227,8 @@ One `AppError` enum (`thiserror`), carrying `{ code: ErrorCode, message: String,
 | `image_too_large` | 400 | ad-hoc string in source |
 | `storj_not_configured` | 503 | ad-hoc string in source |
 
+Two codes are declared in Python's `codes.py` but never raised anywhere (`not_implemented`, `queue_error`) — carry them in the Rust `ErrorCode` enum for wire/registry completeness, but no call site should ever produce them, matching Python. Separately, an unmatched route (no handler at all, not an `AppError`) falls through to Starlette's framework-level 404 in Python, which produces a differently-shaped body: `{"error":{"code":"404","message":"Not Found"}}` — note `code` is the **status code as a literal string**, not a semantic code, unlike every other row in this table. Axum's equivalent is its `Router::fallback` handler; it must produce this same literal-status-code-as-string shape for parity, not the semantic-code shape used elsewhere.
+
 ## 8. Configuration
 
 ### 8.1 Static `Settings` (env-loaded, restart required)
@@ -235,6 +239,8 @@ Full field list, types, defaults, and env var names/aliases are specified in the
 - `default_policy_version` and `clickhouse_secondary_database_url` are dead settings in Python (declared, never read). Not worth porting as functioning config — either omit them or keep as inert fields with a comment noting they're vestigial, implementer's choice, but do not wire them to new behavior.
 
 All settings, their exact env var names, types, and defaults are enumerated in the companion audit document's §1 table (`2026-07-21-python-service-source-audit.md`, same directory as this spec) — Phase 1 implementation must transcribe that table directly into the `config` crate rather than re-deriving it from `plan.md`, which is missing several of these (GPU/image retry backoff vars, KVRocks pool retry vars, KVRocks mTLS PEM-vs-path handling).
+
+The Rust `Settings` struct **extends** that table rather than mirroring it 1:1 — it also needs the new Postgres pool-sizing fields from §6.4 (`POSTGRES_POOL_MAX_CONNECTIONS`, `POSTGRES_POOL_MIN_CONNECTIONS`, `POSTGRES_POOL_ACQUIRE_TIMEOUT_SECONDS`) and the runtime-config poll interval from §8.2 (`RUNTIME_CONFIG_POLL_INTERVAL_SECONDS`), neither of which exist in Python. "Transcribe exactly" applies to the audit's existing fields; it does not mean omitting these Rust-only additions.
 
 Helper methods to port: `internal_request_secret()`, `is_kvrocks_configured()`, `is_gpu_configured()`, `is_clickhouse_configured()`, `is_postgres_configured()`.
 
