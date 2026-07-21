@@ -38,12 +38,21 @@ prakash-nsfw-detection-server/
     repositories/                # trait defs (async-trait) + postgres/clickhouse/kvrocks impls
                                  #   + in-memory fakes behind a `test-fakes` feature
     clients/                     # gpu (openai-compatible chat completions), storj-interface, video download
+    services/                    # orchestration layer, shared by both binaries below: GpuModerationService
+                                 #   (retry loop + the single shared Arc<Semaphore> from §6.2), QueueService,
+                                 #   AggregationService (wraps core::aggregate), VideoDetectionService,
+                                 #   ImageDetectionService, TextDetectionService, ManualBanService,
+                                 #   ReadinessService, ClickHouseFlushService — depends on `core`, `repositories`
+                                 #   (via trait objects), and `clients`; has no HTTP-framework or CLI-entrypoint
+                                 #   concerns of its own
     api/                         # axum binary: routes, HMAC middleware, health/ready, admin config API, OpenAPI
     video-worker/                 # binary: queue consumer, ffmpeg pipeline, GPU batching, finalize+commit
     flush-worker/                  # binary: continuous-loop KVRocks -> ClickHouse buffer flush
 ```
 
 Dependency direction, same discipline as the Python service: `routes -> services -> repositories -> clients/database`. `core` has no dependency on `repositories`/`clients`/`api` — it's pure domain logic and is where most of the high-value unit tests live (moderation policy, legacy mapping, model-response parsing, aggregation), runnable with no tokio runtime.
+
+The `services` crate exists specifically so logic needed by more than one binary has exactly one implementation. Concretely: `GpuModerationService` is used by `api` (stateless `/v1/images/*` and `/v1/text/detect` routes, §18 Phase 4) **and** by `video-worker` (frame-batch dispatch, §6.2/§10) — without a shared crate, these would end up as two hand-written copies of the same retry loop and semaphore, silently breaking §6.3's "applied identically at all three sites" guarantee for the jittered backoff formula. `video-worker` and `flush-worker` binaries are thin: they own the consumer/scheduling loop and call into `services` for everything else, same as `api` does for its routes.
 
 ## 4. Tech Stack
 
@@ -309,7 +318,7 @@ Stage order (per `plan.md`'s "Worker Transaction And Publish Ordering," cross-ch
    - Re-fetch job status; no-op if already terminal (idempotent-redelivery guard).
    - If Postgres already shows `Classified`, sync queue status and return (crash-recovery guard for a crash between Postgres commit and queue-status update).
    - `mark_processing` — increments attempts. **Preserve the dual-counter quirk**: KVRocks and Postgres each track `attempts` independently, kept in sync by convention (both derive from the same base value at each transition) rather than by a single source of truth. Not fixed in this port — flagged as inherited debt.
-   - Download: `reqwest` streamed GET, enforce `video_max_bytes` (default 512 MiB) and `video_download_timeout_seconds` (default 120s), **single attempt** — no retry at this layer (retry happens at the whole-job level via queue retry, matching Python). Python's `download_video` has no logging or Sentry call at all today (a `redact_url()` helper exists in `app/utils/redaction.py` but is dead code, never called) — so there is no URL-redaction behavior to preserve here; port it as a bare download with no error-path logging, matching current behavior. (URL redaction *does* exist and must be ported, but on the image-download path — see §12.)
+   - Download: `reqwest` streamed GET, enforce `video_max_bytes` (default 512 MiB) and `video_download_timeout_seconds` (default 120s), **single attempt** — no retry at this layer (retry happens at the whole-job level via queue retry, matching Python). Python's `download_video` has no logging or Sentry call at all today (a `redact_url()` helper exists in `app/utils/redaction.py` but is never called from application code — its only caller is the ad-hoc `scripts/real_video_pipeline_smoke.py`) — so there is no URL-redaction behavior to preserve here; port it as a bare download with no error-path logging, matching current behavior. (URL redaction *does* exist and must be ported, but on the image-download path — see §12.)
    - `ffprobe -v error -print_format json -show_format -show_streams`, timeout `ffprobe_timeout_seconds` (default 30s). Parse duration/width/height/fps/codec/has_video_stream from the first video-typed stream; `NoVideoStreamError` if none.
    - `ffmpeg -loglevel error -i <src> -vf fps=1 -q:v 3 frame-%06d.jpg`, timeout `ffmpeg_timeout_seconds` (default 300s). Batch frames into groups of `frame_batch_size` (default 5, from `RuntimeConfig`). Frame timestamp is derived from position (`frame_index` as float seconds), not actual PTS — an approximation inherited from the source, preserved.
    - GPU batches dispatched **concurrently** (§6.2), each with the jittered retry loop (§6.3, base 0.25s, cap 2.0s, `gpu_max_attempts` default 3), results reassembled into frame order.
@@ -365,7 +374,9 @@ This must be confirmed against whatever ClickHouse admin/ops process provisions 
 
 ### 13.3 KVRocks / Redis
 
-Key scheme ported 1:1: queue stream/group/DLQ names, `nsfw:gpu:inflight`, the three `nsfw:clickhouse_buffer:*` list keys, `offchain:video_nsfw:{video_id}` (no TTL), and the idempotency keys (`nsfw:video_job:<job_id>` hash, `nsfw:video_job_unique:<video_id>:<source_object_version>:<policy_version>`, `nsfw:video_job_by_video_id:<video_id>` set with `NX`).
+Key scheme ported 1:1: queue stream/group/DLQ names, the three `nsfw:clickhouse_buffer:*` list keys, `offchain:video_nsfw:{video_id}` (no TTL), and the idempotency keys (`nsfw:video_job:<job_id>` hash, `nsfw:video_job_unique:<video_id>:<source_object_version>:<policy_version>`, `nsfw:video_job_by_video_id:<video_id>` set with `NX`).
+
+**Correction**: `plan.md`'s "KVRocks Usage" key list also names `nsfw:gpu:inflight`, intended as a Redis-backed GPU-concurrency coordination key. It was never implemented — no code anywhere in `app/` reads or writes it, and GPU concurrency is controlled purely by an in-process `asyncio.Semaphore(gpu_max_concurrency)` (§6.2 ports this as a single in-process `Arc<Semaphore>`, not a Redis key). This is the same plan-vs-actual-code drift pattern flagged in §2/§5 elsewhere — do not port this key; there is no Redis-based GPU concurrency mechanism to replicate.
 
 **Open decision, not resolved by this spec**: cluster-mode support. Python's enqueue path is atomic (single Redis transaction/pipeline) only in non-cluster mode; in `RedisCluster` mode it issues 4 separate non-atomic calls (no multi-key transactions across hash slots), a real narrow consistency gap. Python also hand-rolls raw `XREADGROUP` protocol calls against cluster nodes because `redis-py`'s high-level cluster client doesn't support blocking reads well. Rust's `redis` crate has similar cluster-mode gaps; whether to (a) mirror Python's manual per-node approach, or (b) switch to the `fred` crate (more complete native cluster+streams support), is a concrete implementation decision for Phase 3/6 — not resolved here since it depends on which KVRocks deployment mode (single-node vs cluster) is actually in use, which should be confirmed before picking.
 
