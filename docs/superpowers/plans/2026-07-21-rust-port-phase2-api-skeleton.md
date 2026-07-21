@@ -12,7 +12,7 @@
 
 **Note on the spec's `IntoResponse for AppError` wording:** spec §7.3 says "`IntoResponse for AppError` produces the identical envelope." Read literally this is impossible — `AppError` is defined in `nsfw-core`, `IntoResponse` is defined in `axum`, and Rust's orphan rule forbids implementing a foreign trait for a foreign type from a third crate (`nsfw-api`). This plan uses the standard, idiomatic fix: a local newtype `ApiError(pub AppError)` in `nsfw-api`, with `impl IntoResponse for ApiError` (satisfies the orphan rule — the type is local) and `impl From<AppError> for ApiError` (so `?` on any `Result<T, AppError>`-returning call auto-converts in a handler that returns `Result<T, ApiError>`). Same wire behavior the spec describes; different, necessary Rust mechanics.
 
-Every piece of code in this plan has already been verified end-to-end in a scratch workspace (built, `clippy -D warnings` clean, `cargo fmt --check` clean, 11 integration tests passing against real axum request/response plumbing) before being written into this document — not just eyeballed.
+Every piece of code in this plan has already been verified end-to-end in a scratch workspace (built, `clippy -D warnings` clean, 11 integration tests passing against real axum request/response plumbing) before being written into this document — not just eyeballed. **Formatting note** (same convention as Phase 1): the code as transcribed into this plan's task-by-task order is not yet `rustfmt`-clean as a whole — `cargo fmt --all -- --check` on the fully assembled crate reports diffs (rustfmt wants `lib.rs`'s `pub mod` declarations reordered alphabetically, plus a few lines over the 100-char width). Run `cargo fmt --all` before every commit in this plan (Task 8 already accounts for this at the final gate), not a sign anything is wrong.
 
 ---
 
@@ -58,7 +58,7 @@ version.workspace = true
 nsfw-core = { path = "../nsfw-core" }
 nsfw-config = { path = "../nsfw-config" }
 tokio = { version = "1", features = ["full"] }
-axum = "0.8"
+axum = "0.8.9"
 tower = "0.5"
 http = { workspace = true }
 http-body-util = "0.1"
@@ -843,7 +843,7 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/docs
 kill %1
 ```
 
-Expected: `/health` → `{"status":"ok"}`; `/ready` → `503` with all 7 dependencies `false` except possibly `internal_auth` (`true`, since the secret is set); `/openapi.json` → valid OpenAPI JSON starting with `{"openapi":...`; `/docs` → `200` (Swagger UI HTML).
+Expected: `/health` → `{"status":"ok"}`; `/ready` → `503` with all 7 dependencies `false` except possibly `internal_auth` (`true`, since the secret is set); `/openapi.json` → valid OpenAPI JSON starting with `{"openapi":...`; `/docs` → `303` redirecting to `/docs/` (curl without `-L` shows the redirect; `curl -sL` or hitting `/docs/` directly returns `200` with the Swagger UI HTML) — this is `utoipa-swagger-ui`'s own bare-path-redirect behavior, not a bug.
 
 - [ ] **Step 4: Commit**
 
