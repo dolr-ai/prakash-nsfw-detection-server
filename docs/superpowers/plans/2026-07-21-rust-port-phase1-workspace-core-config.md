@@ -12,7 +12,7 @@
 
 **Naming note (minor refinement from the spec's illustrative tree):** the spec's architecture diagram (§3) uses the crate name `core`. This plan uses `nsfw-core` instead — a bare crate named `core` risks colliding with Rust's own sysroot `core` crate name in ways that are easy to get wrong. Same purpose, same contents, safer name. All other crates get an `nsfw-` prefix for consistency.
 
-**Formatting note:** run `cargo fmt --all` before every commit in this plan, not only at the Task 11 completion check. The code in each task's snippets is written for readability in a markdown file, not pre-formatted to rustfmt's exact column-width rules (some helper function signatures in Task 10 exceed 100 chars on one line, for example) — `cargo fmt --all` after pasting a snippet in is expected, not a sign something's wrong. Task 1's CI workflow runs `cargo fmt --all -- --check` on every push, so skipping this per-task means CI goes red on every intermediate commit until a final cleanup at the very end, instead of staying green throughout.
+**Formatting note:** run `cargo fmt --all` before every commit in this plan (each task's "Commit" step), not only at the Task 11 completion check. The code in every task's snippets is written for readability in a markdown file, not pre-formatted to rustfmt's exact column-width rules — several files across both crates have lines that wrap differently once run through rustfmt. `cargo fmt --all` after pasting a snippet in is expected, not a sign something's wrong. Task 1's CI workflow runs `cargo fmt --all -- --check` on every push, so skipping this per-task means CI goes red on every intermediate commit until a final cleanup at the very end, instead of staying green throughout.
 
 ---
 
@@ -1688,6 +1688,24 @@ mod tests {
     }
 
     #[test]
+    fn is_clickhouse_configured_requires_primary_database_url() {
+        let none = Settings::from_map(&HashMap::new()).unwrap();
+        assert!(!none.is_clickhouse_configured());
+        let configured =
+            Settings::from_map(&map(&[("CLICKHOUSE_PRIMARY_DATABASE_URL", "https://ch.example.com")])).unwrap();
+        assert!(configured.is_clickhouse_configured());
+    }
+
+    #[test]
+    fn is_postgres_configured_requires_database_url() {
+        let none = Settings::from_map(&HashMap::new()).unwrap();
+        assert!(!none.is_postgres_configured());
+        let configured =
+            Settings::from_map(&map(&[("POSTGRES_DATABASE_URL", "postgresql://localhost/nsfw")])).unwrap();
+        assert!(configured.is_postgres_configured());
+    }
+
+    #[test]
     fn secrets_are_redacted_in_debug_output() {
         let settings = Settings::from_map(&map(&[("INTERNAL_REQUEST_HMAC_SECRET", "super-secret-value")])).unwrap();
         let debug_output = format!("{settings:?}");
@@ -2072,7 +2090,7 @@ pub use settings::*;
 - [ ] **Step 5: Run tests to verify they pass**
 
 Run: `cargo test -p nsfw-config --lib settings`
-Expected: PASS (11 tests).
+Expected: PASS (13 tests).
 
 - [ ] **Step 6: Commit**
 
@@ -2096,7 +2114,7 @@ Run: `cargo clippy --workspace --all-targets -- -D warnings`
 Expected: no warnings.
 
 Run: `cargo test --workspace`
-Expected: all tests pass (`nsfw-core`: moderation, video_status, legacy_mapping, aggregation, models, error, model_output ≈ 63 tests; `nsfw-config`: settings ≈ 9 tests).
+Expected: all tests pass (`nsfw-core`: moderation, video_status, legacy_mapping, aggregation, models, error, model_output — 79 tests; `nsfw-config`: settings — 13 tests; 92 total, see per-task step-5 counts above for the breakdown).
 
 - [ ] **Step 2: Write a short completion note**
 
