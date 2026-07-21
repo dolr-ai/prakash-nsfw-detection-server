@@ -12,6 +12,8 @@
 
 **Naming note (minor refinement from the spec's illustrative tree):** the spec's architecture diagram (§3) uses the crate name `core`. This plan uses `nsfw-core` instead — a bare crate named `core` risks colliding with Rust's own sysroot `core` crate name in ways that are easy to get wrong. Same purpose, same contents, safer name. All other crates get an `nsfw-` prefix for consistency.
 
+**Formatting note:** run `cargo fmt --all` before every commit in this plan, not only at the Task 11 completion check. The code in each task's snippets is written for readability in a markdown file, not pre-formatted to rustfmt's exact column-width rules (some helper function signatures in Task 10 exceed 100 chars on one line, for example) — `cargo fmt --all` after pasting a snippet in is expected, not a sign something's wrong. Task 1's CI workflow runs `cargo fmt --all -- --check` on every push, so skipping this per-task means CI goes red on every intermediate commit until a final cleanup at the very end, instead of staying green throughout.
+
 ---
 
 ## File Structure
@@ -279,7 +281,7 @@ pub use moderation::*;
 - [ ] **Step 5: Run tests to verify they pass**
 
 Run: `cargo test -p nsfw-core --lib moderation`
-Expected: PASS (7 tests: 6 rstest cases + 3 plain tests).
+Expected: PASS (9 tests: 6 rstest cases + 3 plain tests).
 
 - [ ] **Step 6: Commit**
 
@@ -493,7 +495,9 @@ git commit -m "feat: port legacy nsfw_ec/nsfw_gore mapping functions"
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    // Note: no `use std::collections::HashMap` here -- `.collect()` below infers the
+    // type from `AggregationInputFrame::categories`'s field type, so naming it directly
+    // would trip clippy::unused_imports.
 
     fn frame(top_category: &str, overall_severity: u8, cats: &[(&str, u8)], is_nsfw: bool) -> AggregationInputFrame {
         AggregationInputFrame {
@@ -1136,7 +1140,7 @@ pub use error::*;
 - [ ] **Step 5: Run tests to verify they pass**
 
 Run: `cargo test -p nsfw-core --lib error`
-Expected: PASS (25 tests: 23 rstest cases + 2 plain tests).
+Expected: PASS (26 tests: 24 rstest cases + 2 plain tests).
 
 - [ ] **Step 6: Commit**
 
@@ -1402,9 +1406,15 @@ mod batch_and_text_parsing_tests {
 
     #[test]
     fn rejects_a_second_independent_json_document_as_ambiguous() {
-        let raw = format!("{}{}", valid_frame_json(0, "safe", 0), r#"{"unexpected": true}"#);
-        // Two independent top-level values in the same string -- ambiguous, not "take the first one".
-        let result = parse_visual_batch_response(&format!("[{raw}]"), 1);
+        // The whole raw response contains two independent top-level JSON documents back
+        // to back: a valid single-frame array, then a second, separate object. This must
+        // be rejected as ambiguous by `extract_single_json_document` itself -- not "parse
+        // the first document and ignore the trailing garbage". (Wrapping the concatenation
+        // in an outer `[...]` would instead produce a plain array-syntax error before ever
+        // reaching the ambiguity check, which doesn't exercise the behavior this test needs.)
+        let first_document = format!("[{}]", valid_frame_json(0, "safe", 0));
+        let raw = format!("{first_document}{}", r#"{"unexpected": true}"#);
+        let result = parse_visual_batch_response(&raw, 1);
         assert!(result.is_err());
     }
 
@@ -1479,16 +1489,13 @@ fn extract_single_json_document(raw: &str) -> Result<serde_json::Value, ModelOut
 }
 
 fn unwrap_envelope(value: serde_json::Value, keys: &[&str]) -> serde_json::Value {
-    if let serde_json::Value::Object(ref map) = value {
-        if map.len() == 1 {
-            if let Some((key, inner)) = map.iter().next() {
-                if keys.contains(&key.as_str()) {
-                    return inner.clone();
-                }
-            }
-        }
-    }
-    value
+    let unwrapped = value.as_object().filter(|map| map.len() == 1).and_then(|map| {
+        map.iter()
+            .next()
+            .filter(|(key, _)| keys.contains(&key.as_str()))
+            .map(|(_, inner)| inner.clone())
+    });
+    unwrapped.unwrap_or(value)
 }
 
 fn parse_categories_object(value: Option<&serde_json::Value>) -> Result<HashMap<String, u8>, ModelOutputError> {
@@ -1686,6 +1693,40 @@ mod tests {
         let debug_output = format!("{settings:?}");
         assert!(!debug_output.contains("super-secret-value"));
     }
+
+    #[test]
+    fn lowercase_field_name_settings_are_matched_case_insensitively() {
+        // pydantic-settings matches env vars case-insensitively -- a real deployment might
+        // set MOVE_THRESHOLD (shell convention) even though the Python attribute is
+        // lowercase `move_threshold`. This must keep working in the Rust port too.
+        let settings = Settings::from_map(&map(&[("MOVE_THRESHOLD", "0.5")])).unwrap();
+        assert_eq!(settings.move_threshold, 0.5);
+
+        let settings = Settings::from_map(&map(&[("queue_stream_name", "custom:stream")])).unwrap();
+        assert_eq!(settings.queue_stream_name, "custom:stream");
+    }
+
+    #[test]
+    fn postgres_pool_and_runtime_config_poll_settings_have_sane_defaults() {
+        // Rust-only additions (spec §6.4/§8.2) -- not present in Python, added because
+        // this port needs explicit pool sizing and a poll cadence Python never had.
+        let settings = Settings::from_map(&HashMap::new()).unwrap();
+        assert_eq!(settings.postgres_pool_max_connections, 10);
+        assert_eq!(settings.postgres_pool_min_connections, 1);
+        assert_eq!(settings.postgres_pool_acquire_timeout_seconds, 30.0);
+        assert_eq!(settings.runtime_config_poll_interval_seconds, 15);
+    }
+
+    #[test]
+    fn postgres_pool_and_runtime_config_poll_settings_are_configurable() {
+        let settings = Settings::from_map(&map(&[
+            ("POSTGRES_POOL_MAX_CONNECTIONS", "50"),
+            ("RUNTIME_CONFIG_POLL_INTERVAL_SECONDS", "30"),
+        ]))
+        .unwrap();
+        assert_eq!(settings.postgres_pool_max_connections, 50);
+        assert_eq!(settings.runtime_config_poll_interval_seconds, 30);
+    }
 }
 ```
 
@@ -1852,6 +1893,17 @@ pub struct Settings {
     pub clickhouse_buffer_legacy_key: String,
     pub clickhouse_buffer_storage_actions_key: String,
     pub runtime_nsfw_key_prefix: String,
+
+    /// Rust-only addition, not present in Python (spec §6.4) -- sqlx pool sizing,
+    /// tuned independently per binary via the same env var, different deployed values.
+    pub postgres_pool_max_connections: u32,
+    pub postgres_pool_min_connections: u32,
+    pub postgres_pool_acquire_timeout_seconds: f64,
+    /// Rust-only addition, not present in Python (spec §8.2) -- how often api/video-worker/
+    /// flush-worker poll KVRocks for RuntimeConfig changes. RuntimeConfig itself isn't
+    /// implemented until Phase 3/8 (needs the KVRocks repository); this field just reserves
+    /// the static setting that controls its poll cadence once it exists.
+    pub runtime_config_poll_interval_seconds: u32,
 }
 
 impl Settings {
@@ -1859,10 +1911,17 @@ impl Settings {
         Self::from_map(&std::env::vars().collect())
     }
 
+    /// pydantic-settings' `BaseSettings` matches env vars case-insensitively by default
+    /// (no `case_sensitive=True` anywhere in the Python source) -- normalize the incoming
+    /// map to uppercase keys once, so this Rust port accepts either casing convention
+    /// exactly like Python does, instead of silently falling back to defaults if a real
+    /// deployment's `.env` happens to use a different case than this file's literals.
     pub fn from_map(vars: &HashMap<String, String>) -> Result<Self, ConfigError> {
+        let vars: HashMap<String, String> = vars.iter().map(|(k, v)| (k.to_uppercase(), v.clone())).collect();
+        let vars = &vars;
         Ok(Self {
-            app_name: get_string(vars, "app_name", "yral-nsfw-detector"),
-            environment: get_string(vars, "environment", "local"),
+            app_name: get_string(vars, "APP_NAME", "yral-nsfw-detector"),
+            environment: get_string(vars, "ENVIRONMENT", "local"),
 
             internal_request_hmac_secret: get_secret(vars, "INTERNAL_REQUEST_HMAC_SECRET"),
             internal_request_max_skew_sec: get_i64(vars, "INTERNAL_REQUEST_MAX_SKEW_SEC", 300)?,
@@ -1896,40 +1955,40 @@ impl Settings {
             clickhouse_excluded_videos_table: get_string(vars, "CLICKHOUSE_EXCLUDED_VIDEOS_TABLE", "excluded_videos"),
             clickhouse_storage_actions_table: get_string(
                 vars,
-                "clickhouse_storage_actions_table",
+                "CLICKHOUSE_STORAGE_ACTIONS_TABLE",
                 "video_nsfw_storage_actions",
             ),
 
             storj_interface_url: vars.get("STORJ_INTERFACE_URL").cloned(),
             storj_interface_token: get_secret(vars, "STORJ_INTERFACE_TOKEN"),
-            storj_interface_timeout_seconds: get_f64(vars, "storj_interface_timeout_seconds", 10.0)?,
+            storj_interface_timeout_seconds: get_f64(vars, "STORJ_INTERFACE_TIMEOUT_SECONDS", 10.0)?,
 
             api_base_url: get_first(vars, &["API_BASE_URL", "API_BASE_URL "]).map(str::to_string),
             api_key: get_first(vars, &["API_KEY", "API_KEY "]).map(|v| SecretString::from(v.to_string())),
             model_name: get_first(vars, &["MODEL_NAME", "MODEL_NAME "]).map(str::to_string),
-            model_provider: get_string(vars, "model_provider", "openai-compatible"),
-            model_version: vars.get("model_version").cloned(),
+            model_provider: get_string(vars, "MODEL_PROVIDER", "openai-compatible"),
+            model_version: vars.get("MODEL_VERSION").cloned(),
 
             sentry_dsn: get_secret(vars, "SENTRY_DSN"),
             sentry_send_default_pii: get_bool(vars, "SENTRY_SEND_DEFAULT_PII", false)?,
 
-            default_policy_version: get_string(vars, "default_policy_version", "nsfw_policy_v1"),
-            visual_prompt_version: get_string(vars, "visual_prompt_version", "visual_batch_moderation_v1"),
-            image_prompt_version: get_string(vars, "image_prompt_version", "image_generation_moderation_v1"),
+            default_policy_version: get_string(vars, "DEFAULT_POLICY_VERSION", "nsfw_policy_v1"),
+            visual_prompt_version: get_string(vars, "VISUAL_PROMPT_VERSION", "visual_batch_moderation_v1"),
+            image_prompt_version: get_string(vars, "IMAGE_PROMPT_VERSION", "image_generation_moderation_v1"),
             image_text_prompt_version: get_string(
                 vars,
-                "image_text_prompt_version",
+                "IMAGE_TEXT_PROMPT_VERSION",
                 "image_prompt_generation_moderation_v1",
             ),
-            text_prompt_version: get_string(vars, "text_prompt_version", "text_moderation_v1"),
-            aggregation_version: get_string(vars, "aggregation_version", "hard_any_frame_v1"),
+            text_prompt_version: get_string(vars, "TEXT_PROMPT_VERSION", "text_moderation_v1"),
+            aggregation_version: get_string(vars, "AGGREGATION_VERSION", "hard_any_frame_v1"),
 
-            frame_batch_size: get_u32(vars, "frame_batch_size", 5)?,
-            gpu_max_concurrency: get_u32(vars, "gpu_max_concurrency", 5)?,
-            gpu_max_attempts: get_u32(vars, "gpu_max_attempts", 3)?,
+            frame_batch_size: get_u32(vars, "FRAME_BATCH_SIZE", 5)?,
+            gpu_max_concurrency: get_u32(vars, "GPU_MAX_CONCURRENCY", 5)?,
+            gpu_max_attempts: get_u32(vars, "GPU_MAX_ATTEMPTS", 3)?,
             gpu_retry_base_delay_seconds: get_f64(vars, "GPU_RETRY_BASE_DELAY_SECONDS", 0.25)?,
 
-            image_max_bytes: get_u64(vars, "image_max_bytes", 10 * 1024 * 1024)?,
+            image_max_bytes: get_u64(vars, "IMAGE_MAX_BYTES", 10 * 1024 * 1024)?,
             image_download_timeout_seconds: get_f64(vars, "IMAGE_DOWNLOAD_TIMEOUT_SECONDS", 30.0)?,
             image_download_max_attempts: get_u32(vars, "IMAGE_DOWNLOAD_MAX_ATTEMPTS", 3)?,
             image_download_retry_base_delay_seconds: get_f64(
@@ -1938,38 +1997,43 @@ impl Settings {
                 0.5,
             )?,
 
-            video_download_timeout_seconds: get_f64(vars, "video_download_timeout_seconds", 120.0)?,
-            video_max_bytes: get_u64(vars, "video_max_bytes", 512 * 1024 * 1024)?,
-            video_temp_root: get_string(vars, "video_temp_root", "/tmp/nsfw"),
-            ffprobe_timeout_seconds: get_f64(vars, "ffprobe_timeout_seconds", 30.0)?,
-            ffmpeg_timeout_seconds: get_f64(vars, "ffmpeg_timeout_seconds", 300.0)?,
+            video_download_timeout_seconds: get_f64(vars, "VIDEO_DOWNLOAD_TIMEOUT_SECONDS", 120.0)?,
+            video_max_bytes: get_u64(vars, "VIDEO_MAX_BYTES", 512 * 1024 * 1024)?,
+            video_temp_root: get_string(vars, "VIDEO_TEMP_ROOT", "/tmp/nsfw"),
+            ffprobe_timeout_seconds: get_f64(vars, "FFPROBE_TIMEOUT_SECONDS", 30.0)?,
+            ffmpeg_timeout_seconds: get_f64(vars, "FFMPEG_TIMEOUT_SECONDS", 300.0)?,
 
-            move_threshold: get_f64(vars, "move_threshold", 0.8)?,
+            move_threshold: get_f64(vars, "MOVE_THRESHOLD", 0.8)?,
 
-            queue_stream_name: get_string(vars, "queue_stream_name", "nsfw:queue:video_detection"),
-            queue_group_name: get_string(vars, "queue_group_name", "nsfw_video_workers"),
+            queue_stream_name: get_string(vars, "QUEUE_STREAM_NAME", "nsfw:queue:video_detection"),
+            queue_group_name: get_string(vars, "QUEUE_GROUP_NAME", "nsfw_video_workers"),
             queue_consumer_name: vars.get("QUEUE_CONSUMER_NAME").cloned(),
             queue_read_count: get_u32(vars, "QUEUE_READ_COUNT", 1)?,
             queue_block_ms: get_u32(vars, "QUEUE_BLOCK_MS", 5000)?,
             queue_max_attempts: get_u32(vars, "QUEUE_MAX_ATTEMPTS", 3)?,
-            queue_dlq_stream_name: get_string(vars, "queue_dlq_stream_name", "nsfw:queue:video_detection:dlq"),
+            queue_dlq_stream_name: get_string(vars, "QUEUE_DLQ_STREAM_NAME", "nsfw:queue:video_detection:dlq"),
 
             clickhouse_buffer_video_results_key: get_string(
                 vars,
-                "clickhouse_buffer_video_results_key",
+                "CLICKHOUSE_BUFFER_VIDEO_RESULTS_KEY",
                 "nsfw:clickhouse_buffer:video_results",
             ),
             clickhouse_buffer_legacy_key: get_string(
                 vars,
-                "clickhouse_buffer_legacy_key",
+                "CLICKHOUSE_BUFFER_LEGACY_KEY",
                 "nsfw:clickhouse_buffer:legacy_nsfw_agg",
             ),
             clickhouse_buffer_storage_actions_key: get_string(
                 vars,
-                "clickhouse_buffer_storage_actions_key",
+                "CLICKHOUSE_BUFFER_STORAGE_ACTIONS_KEY",
                 "nsfw:clickhouse_buffer:storage_actions",
             ),
-            runtime_nsfw_key_prefix: get_string(vars, "runtime_nsfw_key_prefix", "offchain:video_nsfw:"),
+            runtime_nsfw_key_prefix: get_string(vars, "RUNTIME_NSFW_KEY_PREFIX", "offchain:video_nsfw:"),
+
+            postgres_pool_max_connections: get_u32(vars, "POSTGRES_POOL_MAX_CONNECTIONS", 10)?,
+            postgres_pool_min_connections: get_u32(vars, "POSTGRES_POOL_MIN_CONNECTIONS", 1)?,
+            postgres_pool_acquire_timeout_seconds: get_f64(vars, "POSTGRES_POOL_ACQUIRE_TIMEOUT_SECONDS", 30.0)?,
+            runtime_config_poll_interval_seconds: get_u32(vars, "RUNTIME_CONFIG_POLL_INTERVAL_SECONDS", 15)?,
         })
     }
 
@@ -2008,7 +2072,7 @@ pub use settings::*;
 - [ ] **Step 5: Run tests to verify they pass**
 
 Run: `cargo test -p nsfw-config --lib settings`
-Expected: PASS (9 tests).
+Expected: PASS (11 tests).
 
 - [ ] **Step 6: Commit**
 
