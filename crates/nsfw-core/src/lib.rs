@@ -9,3 +9,5 @@ pub mod aggregation;
 pub use aggregation::*;
 pub mod models;
 pub use models::*;
+pub mod error;
+pub use error::*;
