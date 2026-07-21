@@ -9,9 +9,9 @@ Target repo: `/Users/prk-jr/Desktop/work/dolr/prakash-nsfw-detection-server` (th
 Port the existing Python NSFW detection service to Rust. The Python service is itself a from-scratch rewrite (see its own `plan.md`) of an older gRPC pipeline into a FastAPI REST API plus two background worker processes. This spec targets a full port of that current (REST + workers) system — not the legacy gRPC code, which stays retired.
 
 Goals:
-- Byte-for-byte wire and business-rule parity with the current Python service, **except** for two categories of deliberate change: (a) fixes to Python's operational gaps that have no working implementation to be compatible with (ClickHouse flush scheduling, worker deployment), and (b) explicit, called-out performance improvements that Rust's concurrency model makes cheap (see §6).
+- Byte-for-byte wire and business-rule parity with the current Python service, **except** for two categories of deliberate change: (a) a real fix for the one operational gap this spec fully resolves — the ClickHouse flush worker's missing scheduling loop (§11) — and (b) explicit, called-out performance improvements that Rust's concurrency model makes cheap (see §6).
 - Preserve every legacy-compatibility contract: `yral.video_nsfw_agg` old-schema table, `offchain:video_nsfw:{video_id}` KVRocks runtime key, the `/v1/videos/{video_id}/status` read path — downstream readers of these must not need to change.
-- Close two real gaps the source audit found that have zero current implementation: `excluded_videos` ClickHouse table has no DDL anywhere, and neither background worker has a deployment definition anywhere in the source repo.
+- Close one real gap the source audit found that has zero current implementation: the `excluded_videos` ClickHouse table has no DDL anywhere (§13.2). A second gap — neither background worker has a deployment definition anywhere in the source repo — is surfaced and flagged (§15, §17 item 1) but its resolution (which supervision mechanism to use) is explicitly deferred, not decided, by this spec.
 
 Non-goals:
 - Porting `app/legacy/` (old gRPC server, GCS/BigQuery pipeline, local ML classifiers). Explicitly out of scope, same as it was for the Python rewrite.
@@ -21,6 +21,8 @@ Non-goals:
 ## 2. How This Spec Was Produced
 
 The source repo has its own `plan.md`, a genuinely detailed design doc, written before the Python implementation existed. Reading the *actual current code* against that plan turned up real drift — most importantly, the NSFW classification threshold logic in production does **not** match what `plan.md` describes. This spec is built from the **actual code**, not from `plan.md`'s prose, wherever the two disagree. Every place they disagree is called out explicitly below so the disagreement is a decision, not an accident.
+
+That code-reading pass is written up in full in a companion reference document: [2026-07-21-python-service-source-audit.md](2026-07-21-python-service-source-audit.md), in the same directory as this spec. Every "per the audit §N" reference below points at that file's numbered sections. Implementers should treat that file, not `plan.md`, as the source of truth for exact field lists, env var names, and method signatures wherever this spec says to "transcribe" or "port verbatim" rather than reproducing the full detail inline.
 
 ## 3. Workspace & Crate Architecture
 
@@ -58,6 +60,7 @@ Dependency direction, same discipline as the Python service: `routes -> services
 | Error handling | `thiserror` domain error enum in `core`; `axum::response::IntoResponse` impl in `api` | mirrors Python's `AppError(code, message, status_code)` triple exactly |
 | Config | hand-rolled `serde`/`std::env` struct for static `Settings`; separate `RuntimeConfig` (§8.2) | needs to replicate pydantic-settings' trailing-space-alias quirk (§8.1) and fail-fast-on-missing-required behavior |
 | Sentry | `sentry` crate + tower layer | parity with Python's breadcrumbs/tags on GPU retry attempts and 5xx responses |
+| Logging/tracing | `tracing` + `tracing-subscriber` (structured JSON output) | needed for the structured-log requirement on every admin-config change (§8.2) and general parity with Python's existing structured logging; not present in Python's own dependency list but required to meet this spec's own logging requirements |
 | Video probing/extraction | `tokio::process::Command` shelling to system `ffmpeg`/`ffprobe` | same approach as Python — no native Rust video decode needed |
 | OpenAPI | `utoipa` + `utoipa-swagger-ui` | axum has no FastAPI-style auto docs; this replicates `/openapi.json` + a Swagger UI, mounted only in the `api` crate |
 | Testing | `#[tokio::test]`, `mockall` (repo/client trait mocks), `rstest` (parameterized threshold/mapping tests), `testcontainers-rs` (real ephemeral Postgres/ClickHouse/Redis for repository integration tests) | see §14 |
@@ -134,7 +137,60 @@ pub const TERMINAL_VIDEO_STATUSES: [VideoJobStatus; 3] =
 
 ### 7.2 Domain structs
 
-Direct ports of `app/models/*.py` dataclasses: `VideoJob`, `VideoMetadata` (kept as a struct even though nothing currently persists it — see §16 open items), `FrameModerationResult`, `StorageAction`, `VideoModerationResult`. Field sets and types per the source audit — not reproduced field-by-field here since they map 1:1; implementers should read the dataclasses directly when writing the Rust structs in Phase 1.
+Direct ports of `app/models/*.py` dataclasses (audit §10), field-for-field:
+
+```rust
+pub struct FrameModerationResult {
+    pub frame_index: i32,
+    pub frame_timestamp_seconds: f64,
+    pub top_category: String,
+    pub is_nsfw: bool,
+    pub overall_severity: u8,
+    pub categories: HashMap<String, u8>,
+    pub reason: String,
+    pub raw_response: serde_json::Value, // full parsed model output, incl. its own computed fields
+}
+
+pub struct StorageAction {
+    pub action_id: String, pub job_id: String, pub video_id: String, pub publisher_user_id: String,
+    pub action_type: String, pub threshold: f64, pub final_score: f64,
+    pub request_url: String, pub request_body: serde_json::Value,
+    pub response_status: Option<i32>, pub response_body: Option<String>,
+    pub status: String, pub created_at: DateTime<Utc>, pub completed_at: Option<DateTime<Utc>>,
+}
+
+pub struct VideoJob {
+    pub job_id: String, pub video_id: String, pub source_object_version: String, pub policy_version: String,
+    pub status: VideoJobStatus, pub publisher_user_id: String,
+    pub post_id: Option<String>, pub canister_id: Option<String>,
+    pub source_video_uri: String, pub upload_event_id: Option<String>, pub trace_id: Option<String>,
+    pub attempts: i32, // default 0
+    pub last_error_code: Option<String>, pub last_error_message: Option<String>,
+    pub created_at: Option<DateTime<Utc>>, pub updated_at: Option<DateTime<Utc>>,
+    pub started_at: Option<DateTime<Utc>>, pub finished_at: Option<DateTime<Utc>>,
+}
+
+// Kept as a struct even though nothing currently persists it beyond duration_seconds/
+// frames_extracted (see §17 item 3) — width/height/fps/codec_name/has_video_stream
+// are computed by ffprobe parsing but discarded in the source today.
+pub struct VideoMetadata {
+    pub job_id: String, pub video_id: String, pub duration_seconds: f64,
+    pub width: Option<i32>, pub height: Option<i32>, pub fps: Option<f64>,
+    pub codec_name: Option<String>, pub has_video_stream: bool, pub frames_extracted: i32,
+}
+
+pub struct VideoModerationResult {
+    pub job_id: String, pub video_id: String, pub policy_version: String,
+    pub prompt_version: String, pub aggregation_version: String,
+    pub final_is_nsfw: bool, pub final_score: f64, pub final_top_category: String,
+    pub max_overall_severity: u8, pub nsfw_frame_count: i32, pub total_frame_count: i32,
+    pub move_required: bool, pub move_threshold: f64,
+    pub max_category_severities: HashMap<String, u8>,
+    pub legacy_nsfw_ec: String, pub legacy_nsfw_gore: String,
+    pub final_response: serde_json::Value,
+    pub created_at: DateTime<Utc>, pub updated_at: DateTime<Utc>,
+}
+```
 
 ### 7.3 Error handling
 
@@ -178,13 +234,13 @@ Full field list, types, defaults, and env var names/aliases are specified in the
 - `API_BASE_URL`, `API_KEY`, `MODEL_NAME` each also accept a **trailing-space** alias (`"API_BASE_URL "`, etc.) — a historical `.env` typo compat shim. If the Rust config loader doesn't also accept the trailing-space variant, production config silently breaks on cutover. Preserve it.
 - `default_policy_version` and `clickhouse_secondary_database_url` are dead settings in Python (declared, never read). Not worth porting as functioning config — either omit them or keep as inert fields with a comment noting they're vestigial, implementer's choice, but do not wire them to new behavior.
 
-All settings, their exact env var names, types, and defaults are enumerated in the audit produced during this design's research phase (§2) — Phase 1 implementation must transcribe that table directly into the `config` crate rather than re-deriving it from `plan.md`, which is missing several of these (GPU/image retry backoff vars, KVRocks pool retry vars, KVRocks mTLS PEM-vs-path handling).
+All settings, their exact env var names, types, and defaults are enumerated in the companion audit document's §1 table (`2026-07-21-python-service-source-audit.md`, same directory as this spec) — Phase 1 implementation must transcribe that table directly into the `config` crate rather than re-deriving it from `plan.md`, which is missing several of these (GPU/image retry backoff vars, KVRocks pool retry vars, KVRocks mTLS PEM-vs-path handling).
 
 Helper methods to port: `internal_request_secret()`, `is_kvrocks_configured()`, `is_gpu_configured()`, `is_clickhouse_configured()`, `is_postgres_configured()`.
 
 ### 8.2 Runtime-configurable tunables (new — not present in Python)
 
-A second, smaller config surface that's live-tunable via an authenticated admin API without a restart:
+Explicitly requested and confirmed during design (not an unrequested addition): a second, smaller config surface that's live-tunable via an authenticated admin API without a restart.
 
 ```
 move_threshold, category_block_thresholds (all 10 non-safe categories),
@@ -306,7 +362,7 @@ Key scheme ported 1:1: queue stream/group/DLQ names, `nsfw:gpu:inflight`, the th
 
 ### 13.4 Repository traits (`repositories` crate)
 
-`async-trait`-based traits per the audit's §11 method signatures (`VideoQueueRepository`, `ClickHouseBufferRepository`, `RuntimeNsfwRepository`, `VideoJobRepository`, `VideoJobStateRepository`, `FinalResultUnitOfWork`, `VideoResultRepository`, `FrameResultRepository`, `StorageActionRepository`, plus the four write-only ClickHouse row repositories) — object-safe for `Box<dyn Trait>` swapping between real and in-memory-fake implementations in tests, mirroring Python's `Protocol` + concrete-impl pattern. Method signatures should be transcribed directly from the audit rather than re-derived, since several (e.g. `VideoJobStateRepository::mark_processing`'s upsert-then-update snapshot logic) encode non-obvious behavior.
+`async-trait`-based traits per the companion audit document's §11 method signatures (`VideoQueueRepository`, `ClickHouseBufferRepository`, `RuntimeNsfwRepository`, `VideoJobRepository`, `VideoJobStateRepository`, `FinalResultUnitOfWork`, `VideoResultRepository`, `FrameResultRepository`, `StorageActionRepository`, plus the four write-only ClickHouse row repositories) — object-safe for `Box<dyn Trait>` swapping between real and in-memory-fake implementations in tests, mirroring Python's `Protocol` + concrete-impl pattern. Method signatures should be transcribed directly from that document rather than re-derived, since several (e.g. `VideoJobStateRepository::mark_processing`'s upsert-then-update snapshot logic) encode non-obvious behavior.
 
 ## 14. Testing Strategy
 
