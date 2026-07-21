@@ -5,3 +5,5 @@ pub mod video_status;
 pub use video_status::*;
 pub mod legacy_mapping;
 pub use legacy_mapping::*;
+pub mod aggregation;
+pub use aggregation::*;
