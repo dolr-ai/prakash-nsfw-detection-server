@@ -1,0 +1,14 @@
+[package]
+name = "nsfw-core"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+http = { workspace = true }
+
+[dev-dependencies]
+rstest = { workspace = true }

@@ -1,0 +1,8 @@
+[package]
+name = "nsfw-config"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+secrecy = { workspace = true }
+thiserror = { workspace = true }
