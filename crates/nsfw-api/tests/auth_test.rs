@@ -115,3 +115,33 @@ async fn rejects_stale_timestamp() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn accepts_signed_request_through_a_nested_router() {
+    // Signs the FULL path (/v1/protected) but mounts the middleware inside a nested
+    // /v1 router -- reproduces the axum nest-path-rewrite bug. Must be 200, not 401.
+    let settings = settings_with_secret("test-secret");
+    let timestamp = chrono::Utc::now().timestamp().to_string();
+    let signature = sign("test-secret", &timestamp, "GET", "/v1/protected", b"");
+
+    let inner: Router = Router::new()
+        .route("/protected", get(|| async { "ok" }))
+        .layer(middleware::from_fn_with_state(
+            settings,
+            require_signed_request,
+        ));
+    let app: Router = Router::new().nest("/v1", inner);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/protected")
+                .header(TIMESTAMP_HEADER, &timestamp)
+                .header(SIGNATURE_HEADER, &signature)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
