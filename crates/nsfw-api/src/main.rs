@@ -20,6 +20,8 @@ struct ApiDoc;
 
 #[tokio::main]
 async fn main() {
+    // Load a local .env if present (no-op in prod where env vars come from compose/CI).
+    let _ = dotenvy::dotenv();
     let settings = Arc::new(Settings::from_env().expect("failed to load settings"));
     let http_client = reqwest::Client::new();
 
