@@ -1,0 +1,16 @@
+[package]
+name = "nsfw-services"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+nsfw-core = { path = "../nsfw-core" }
+nsfw-clients = { path = "../nsfw-clients" }
+tokio = { version = "1", features = ["full"] }
+rand = "0.8"
+thiserror = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["json"] }
+wiremock = "0.6"

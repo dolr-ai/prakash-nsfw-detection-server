@@ -882,4 +882,4 @@ git commit -m "chore: phase 2 completion — fmt/clippy/test all green"
 
 ## What's Next
 
-This plan covers Phase 2 only (spec §18). Phase 3 (Postgres/ClickHouse/KVRocks repositories, migrations, DDL incl. the `excluded_videos` gap and the 39-vs-45-column reconciliation, in-memory fakes) gets its own plan once this one is executed and reviewed.
+This plan covers Phase 2 only (spec §18). **Note:** the spec's phase order was later revised — the data layer phase (Postgres/ClickHouse/KVRocks repositories, migrations, DDL incl. the `excluded_videos` gap and the 39-vs-45-column reconciliation, in-memory fakes) moved from position 3 to position 4, deferred behind stateless endpoints (now position 3) since it has a real external gate (live-infra access) that isn't available yet. See spec §18 for the current order and rationale.

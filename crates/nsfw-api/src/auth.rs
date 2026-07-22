@@ -64,6 +64,17 @@ pub async fn require_signed_request(
     req: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
+    // The signed path must be the ORIGINAL request path (e.g. `/v1/text/detect`), the
+    // exact path the caller signed -- not `parts.uri.path()`, which axum rewrites to the
+    // nest-relative path (`/text/detect`) when this middleware runs inside a nested
+    // `/v1` router. `OriginalUri` recovers the pre-nest path. Getting this wrong makes
+    // every signature mismatch (401) the moment the middleware is nested.
+    let original_path = req
+        .extensions()
+        .get::<axum::extract::OriginalUri>()
+        .map(|uri| uri.0.path().to_string())
+        .unwrap_or_else(|| req.uri().path().to_string());
+
     let (parts, body) = req.into_parts();
     let headers = parts.headers.clone();
 
@@ -122,7 +133,7 @@ pub async fn require_signed_request(
         secret_str,
         &timestamp_raw,
         parts.method.as_str(),
-        parts.uri.path(),
+        &original_path,
         &body_bytes,
         &signature,
     ) {
