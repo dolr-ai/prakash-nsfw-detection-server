@@ -6,6 +6,8 @@ version.workspace = true
 [dependencies]
 nsfw-core = { path = "../nsfw-core" }
 nsfw-config = { path = "../nsfw-config" }
+nsfw-clients = { path = "../nsfw-clients" }
+nsfw-services = { path = "../nsfw-services" }
 tokio = { version = "1", features = ["full"] }
 axum = "0.8.9"
 tower = "0.5"
@@ -18,9 +20,13 @@ chrono = { workspace = true }
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
+base64 = "0.22"
+reqwest = { version = "0.12", features = ["json"] }
+rand = "0.8"
 uuid = { version = "1", features = ["v4"] }
 utoipa = { version = "5", features = ["axum_extras"] }
 utoipa-swagger-ui = { version = "9", features = ["axum"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+wiremock = "0.6"

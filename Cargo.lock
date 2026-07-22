@@ -980,13 +980,18 @@ name = "nsfw-api"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "chrono",
  "hex",
  "hmac",
  "http",
  "http-body-util",
+ "nsfw-clients",
  "nsfw-config",
  "nsfw-core",
+ "nsfw-services",
+ "rand",
+ "reqwest",
  "secrecy",
  "serde",
  "serde_json",
@@ -996,6 +1001,7 @@ dependencies = [
  "utoipa",
  "utoipa-swagger-ui",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
