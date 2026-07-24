@@ -19,26 +19,19 @@ env:
   SERVER_3_IP: 138.201.129.173
 
 jobs:
+  # Same checks the PR ran, defined once in verify.yml.
+  verify:
+    uses: ./.github/workflows/verify.yml
+
   build-and-push:
     name: Build and push image
+    needs: [verify]
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Format / lint / test
-        run: |
-          cargo fmt --all -- --check
-          cargo clippy --workspace --all-targets -- -D warnings
-          cargo test --workspace
 
       - name: Lowercase image name
         id: img
@@ -62,7 +55,11 @@ jobs:
           tags: |
             ${{ env.DOCKER_REGISTRY }}/${{ steps.img.outputs.name }}:${{ github.sha }}
             ${{ env.DOCKER_REGISTRY }}/${{ steps.img.outputs.name }}:latest
-          cache-from: type=registry,ref=${{ env.DOCKER_REGISTRY }}/${{ steps.img.outputs.name }}:cache-main
+          # gha first: reuses layers the PR's docker-build already warmed.
+          # registry cache persists across runners/cache evictions.
+          cache-from: |
+            type=gha
+            type=registry,ref=${{ env.DOCKER_REGISTRY }}/${{ steps.img.outputs.name }}:cache-main
           cache-to: type=registry,ref=${{ env.DOCKER_REGISTRY }}/${{ steps.img.outputs.name }}:cache-main,mode=max
 
   deploy:
