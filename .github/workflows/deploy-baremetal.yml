@@ -87,7 +87,6 @@ jobs:
 
       - name: Validate required config
         run: |
-          [ -n "${{ vars.VAULT_ROLE }}" ] || { echo "::error::repo variable VAULT_ROLE is not set"; exit 1; }
           [ -n "${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}" ] || { echo "::error::secret DEPLOY_SSH_PRIVATE_KEY is not set"; exit 1; }
           [ -n "${{ secrets.INTERNAL_REQUEST_HMAC_SECRET }}" ] || { echo "::error::secret INTERNAL_REQUEST_HMAC_SECRET is not set"; exit 1; }
 
@@ -97,7 +96,9 @@ jobs:
           url: https://vault.yral.com
           method: jwt
           # Vault role bound to this repo (admin-created). Set as a repo Variable.
-          role: ${{ vars.VAULT_ROLE }}
+          # Convention is <repo>-role (cf. yral-video-storage-service-role).
+          # Set the VAULT_ROLE repo variable only to override it.
+          role: ${{ vars.VAULT_ROLE || 'prakash-nsfw-detection-server-role' }}
           jwtGithubAudience: ${{ vars.VAULT_JWT_AUDIENCE || 'https://github.com/dolr-ai' }}
           # Bearer token for the mixture-of-experts LLM endpoint -> API_KEY.
           # Path must match the endpoint in API_BASE_URL. If the field in Vault is
