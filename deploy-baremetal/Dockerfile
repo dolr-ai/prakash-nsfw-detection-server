@@ -9,9 +9,14 @@
 FROM rust:1-slim-bookworm AS builder
 WORKDIR /build
 
-# Build deps for the crates we pull in (reqwest -> native-tls -> openssl).
+# Build deps:
+#   pkg-config/libssl-dev -> reqwest's native-tls backend
+#   curl                  -> utoipa-swagger-ui's build script downloads the
+#                            Swagger UI archive at compile time and shells out to
+#                            `curl` (its `reqwest` feature is off). Without curl the
+#                            build panics: "failed to download Swagger UI".
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    pkg-config libssl-dev \
+    pkg-config libssl-dev curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the whole workspace and build just the API binary in release mode.
