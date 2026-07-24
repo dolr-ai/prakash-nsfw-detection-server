@@ -81,14 +81,16 @@ jobs:
       MODEL_NAME: ${{ vars.PROD_MODEL_NAME || 'Qwen/Qwen3.6-35B-A3B-FP8' }}
       # HMAC secret must match what off-chain-agent signs with. GitHub secret here;
       # move into Vault (like API_KEY below) if you prefer a single source.
-      INTERNAL_REQUEST_HMAC_SECRET: ${{ secrets.INTERNAL_REQUEST_HMAC_SECRET }}
+      # GitHub secret is named NSFW_* (matching off-chain-agent's env var name for
+      # the same shared secret); the service itself reads INTERNAL_REQUEST_HMAC_SECRET.
+      INTERNAL_REQUEST_HMAC_SECRET: ${{ secrets.NSFW_INTERNAL_REQUEST_HMAC_SECRET }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Validate required config
         run: |
           [ -n "${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}" ] || { echo "::error::secret DEPLOY_SSH_PRIVATE_KEY is not set"; exit 1; }
-          [ -n "${{ secrets.INTERNAL_REQUEST_HMAC_SECRET }}" ] || { echo "::error::secret INTERNAL_REQUEST_HMAC_SECRET is not set"; exit 1; }
+          [ -n "${{ secrets.NSFW_INTERNAL_REQUEST_HMAC_SECRET }}" ] || { echo "::error::secret NSFW_INTERNAL_REQUEST_HMAC_SECRET is not set"; exit 1; }
 
       - name: Import secrets from Vault
         uses: hashicorp/vault-action@v3
