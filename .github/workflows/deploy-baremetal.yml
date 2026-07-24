@@ -1,0 +1,174 @@
+name: Deploy (bare-metal)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-baremetal-main
+  cancel-in-progress: false
+
+env:
+  DOCKER_REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  APP_DIR: /home/deploy/nsfw-detection
+  # Three Hetzner nodes (same boxes as the other prakash services; not secret).
+  SERVER_1_IP: 94.130.13.115
+  SERVER_2_IP: 88.99.151.102
+  SERVER_3_IP: 138.201.129.173
+
+jobs:
+  build-and-push:
+    name: Build and push image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format / lint / test
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+
+      - name: Lowercase image name
+        id: img
+        run: echo "name=$(echo '${{ env.IMAGE_NAME }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.DOCKER_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./deploy-baremetal/Dockerfile
+          push: true
+          tags: |
+            ${{ env.DOCKER_REGISTRY }}/${{ steps.img.outputs.name }}:${{ github.sha }}
+            ${{ env.DOCKER_REGISTRY }}/${{ steps.img.outputs.name }}:latest
+          cache-from: type=registry,ref=${{ env.DOCKER_REGISTRY }}/${{ steps.img.outputs.name }}:cache-main
+          cache-to: type=registry,ref=${{ env.DOCKER_REGISTRY }}/${{ steps.img.outputs.name }}:cache-main,mode=max
+
+  deploy:
+    name: Deploy HA to all nodes
+    needs: [build-and-push]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+      id-token: write        # required for the Vault JWT/OIDC login
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      DEPLOY_USER: deploy
+      # Unique 300x host port for the shared Caddy to reverse-proxy (next free = 3006).
+      HOST_APP_PORT: ${{ vars.HOST_APP_PORT || '3006' }}
+      # Non-secret moderation config (repo Variables). The base URL should point at
+      # the OpenAI-compatible endpoint; the client appends /chat/completions.
+      API_BASE_URL: ${{ vars.PROD_API_BASE_URL || 'https://saikat-llm-mixture-of-experts.yral.com/v1' }}
+      MODEL_NAME: ${{ vars.PROD_MODEL_NAME || 'Qwen/Qwen3.6-35B-A3B-FP8' }}
+      # HMAC secret must match what off-chain-agent signs with. GitHub secret here;
+      # move into Vault (like API_KEY below) if you prefer a single source.
+      INTERNAL_REQUEST_HMAC_SECRET: ${{ secrets.INTERNAL_REQUEST_HMAC_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate required config
+        run: |
+          [ -n "${{ vars.VAULT_ROLE }}" ] || { echo "::error::repo variable VAULT_ROLE is not set"; exit 1; }
+          [ -n "${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}" ] || { echo "::error::secret DEPLOY_SSH_PRIVATE_KEY is not set"; exit 1; }
+          [ -n "${{ secrets.INTERNAL_REQUEST_HMAC_SECRET }}" ] || { echo "::error::secret INTERNAL_REQUEST_HMAC_SECRET is not set"; exit 1; }
+
+      - name: Import secrets from Vault
+        uses: hashicorp/vault-action@v3
+        with:
+          url: https://vault.yral.com
+          method: jwt
+          # Vault role bound to this repo (admin-created). Set as a repo Variable.
+          role: ${{ vars.VAULT_ROLE }}
+          jwtGithubAudience: ${{ vars.VAULT_JWT_AUDIENCE || 'https://github.com/dolr-ai' }}
+          # Bearer token for the mixture-of-experts LLM endpoint -> API_KEY.
+          # Path must match the endpoint in API_BASE_URL. If the field in Vault is
+          # not named `value` (check the Vault UI), change `value` below.
+          secrets: |
+            secret/data/SAIKAT_LLM_MIXTURE_OF_EXPERTS value | API_KEY ;
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+
+      - name: Deploy to all nodes
+        run: |
+          IMAGE_LC="$(echo '${{ env.IMAGE_NAME }}' | tr '[:upper:]' '[:lower:]')"
+
+          declare -A SERVERS
+          SERVERS=(["server_1"]="${SERVER_1_IP}" ["server_2"]="${SERVER_2_IP}" ["server_3"]="${SERVER_3_IP}")
+
+          for NODE_NAME in server_1 server_2 server_3; do
+            NODE_IP="${SERVERS[$NODE_NAME]}"
+            echo "--> ${NODE_NAME} (${NODE_IP})"
+            ssh-keyscan -H "${NODE_IP}" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+            ssh "${DEPLOY_USER}@${NODE_IP}" "mkdir -p ${APP_DIR}"
+            scp -r deploy-baremetal/* "${DEPLOY_USER}@${NODE_IP}:${APP_DIR}/"
+
+            # Explicit COMPOSE_PROJECT_NAME so our containers/volumes are namespaced
+            # on these boxes (shared by many projects), not derived from the dir name.
+            ssh "${DEPLOY_USER}@${NODE_IP}" \
+              "export COMPOSE_PROJECT_NAME='nsfw-detection'; \
+               export APP_IMAGE='ghcr.io/${IMAGE_LC}'; \
+               export IMAGE_TAG='${{ github.sha }}'; \
+               export HOST_APP_PORT='${HOST_APP_PORT}'; \
+               export API_BASE_URL='${API_BASE_URL}'; \
+               export API_KEY='${API_KEY}'; \
+               export MODEL_NAME='${MODEL_NAME}'; \
+               export INTERNAL_REQUEST_HMAC_SECRET='${INTERNAL_REQUEST_HMAC_SECRET}'; \
+               export ENVIRONMENT='production'; \
+               echo '${GITHUB_TOKEN}' | docker login ghcr.io -u '${{ github.actor }}' --password-stdin && \
+               cd ${APP_DIR} && \
+               docker compose pull app && \
+               docker compose up -d --no-deps --remove-orphans app"
+          done
+
+      - name: Health check all nodes
+        run: |
+          for NODE_IP in "${SERVER_1_IP}" "${SERVER_2_IP}" "${SERVER_3_IP}"; do
+            echo "--> health ${NODE_IP}"
+            ssh-keyscan -H "${NODE_IP}" >> ~/.ssh/known_hosts 2>/dev/null || true
+            ssh "${DEPLOY_USER}@${NODE_IP}" \
+              "curl --fail --retry 20 --retry-delay 3 --retry-all-errors \
+                http://127.0.0.1:${HOST_APP_PORT}/health" || \
+            (ssh "${DEPLOY_USER}@${NODE_IP}" \
+              "cd ${APP_DIR} && COMPOSE_PROJECT_NAME=nsfw-detection docker compose logs --tail=50 app" && exit 1)
+          done
+
+  deployment-summary:
+    name: Deployment summary
+    needs: [deploy]
+    runs-on: ubuntu-latest
+    if: always()
+    permissions: {}
+    steps:
+      - run: |
+          echo "## Deployment Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Status:** ${{ needs.deploy.result }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Image:** ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]'):${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Nodes:** server_1, server_2, server_3 (host port ${{ vars.HOST_APP_PORT || '3006' }} -> Caddy \`localhost:3006\`)" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Public route:** add an \`nsfw.prakash.yral.com\` block to the shared infra Caddyfile (see deploy-baremetal/docker-compose.yml header)" >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,9 @@
+# Keep the build context small and free of host artifacts/secrets.
+target/
+.git/
+.env
+.env.*
+!.env.example
+docs/
+scripts/
+**/*.md
