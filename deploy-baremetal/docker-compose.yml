@@ -1,0 +1,42 @@
+# Compose for the stateless nsfw moderation API, run identically on all 3 nodes.
+# All config comes from the environment (the deploy workflow exports these
+# over SSH before running `docker compose up`). Nothing secret is baked in.
+#
+# Port convention (shared prakash infra): each project publishes on a unique
+# host port in the 300x range, and the shared Caddy on each box reverse-proxies
+# `localhost:<port>`. Claimed: 3001 hello-world, 3002 estatedao, 3003
+# nofeebooking, 3004 storj-interface, 3005 storage-interface, 9000 sentry.
+# This service uses the next free port, 3006. To get a public hostname
+# (e.g. nsfw.prakash.yral.com) a Caddy block must be added to the shared infra
+# (`infra/Caddyfile.template` in yral-onboarding-hello-world-counter-prakash):
+#     nsfw.prakash.yral.com {
+#     __TLS_DIRECTIVE__
+#         encode zstd gzip
+#         reverse_proxy localhost:3006
+#     }
+services:
+  app:
+    image: ${APP_IMAGE:-ghcr.io/dolr-ai/prakash-nsfw-detection-server}:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    ports:
+      - "${HOST_APP_PORT:-3006}:8080"
+    environment:
+      PORT: "8080"
+      # --- moderation LLM (GPU) ---
+      API_BASE_URL: "${API_BASE_URL}"
+      API_KEY: "${API_KEY}"            # pulled from Vault in the workflow
+      MODEL_NAME: "${MODEL_NAME}"
+      # --- internal request signing (must match what off-chain-agent uses) ---
+      INTERNAL_REQUEST_HMAC_SECRET: "${INTERNAL_REQUEST_HMAC_SECRET}"
+      INTERNAL_REQUEST_MAX_SKEW_SEC: "${INTERNAL_REQUEST_MAX_SKEW_SEC:-300}"
+      ENVIRONMENT: "${ENVIRONMENT:-production}"
+    logging:
+      driver: journald
+      options:
+        tag: nsfw-api
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
