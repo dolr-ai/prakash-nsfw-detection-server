@@ -14,10 +14,6 @@ const IMAGE_TEXT_PROMPT: &str =
     include_str!("../prompts/image_prompt_generation_moderation_v1.txt");
 const TEXT_PROMPT: &str = include_str!("../prompts/text_moderation_v1.txt");
 
-#[derive(OpenApi)]
-#[openapi(paths(health::health))]
-struct ApiDoc;
-
 fn main() {
     // Load a local .env if present (no-op in prod where env vars come from compose/CI).
     let _ = dotenvy::dotenv();
@@ -127,7 +123,7 @@ async fn serve(settings: Arc<Settings>) {
         .route("/health", get(health::health))
         .route("/ready", get(health::ready).with_state(checks))
         .nest("/v1", v1_router)
-        .merge(SwaggerUi::new("/docs").url("/openapi.json", ApiDoc::openapi()))
+        .merge(SwaggerUi::new("/docs").url("/openapi.json", nsfw_api::api_doc::ApiDoc::openapi()))
         .fallback(fallback_404)
         .layer(axum::middleware::from_fn(request_id::request_id_middleware));
 

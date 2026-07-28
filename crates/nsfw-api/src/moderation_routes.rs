@@ -9,19 +9,19 @@ use crate::error::ApiError;
 use crate::image_detection::ImageDetectionService;
 use crate::text_detection::TextDetectionService;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct ImageUrlDetectRequest {
     pub image_url: String,
     pub prompt: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct ImageBase64DetectRequest {
     pub image_base64: String,
     pub prompt: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct TextDetectRequest {
     pub text: String,
 }
@@ -50,6 +50,18 @@ fn json_or_validation_error<T>(result: Result<Json<T>, JsonRejection>) -> Result
     })
 }
 
+#[utoipa::path(
+    post, path = "/v1/images/detect-url",
+    request_body = ImageUrlDetectRequest,
+    responses(
+        (status = 200, description = "Moderation verdict", body = ModerationModelOutput),
+        (status = 401, description = "Missing/invalid internal HMAC signature"),
+        (status = 422, description = "Validation error"),
+        (status = 502, description = "Model moderation failed"),
+        (status = 503, description = "GPU moderation not configured"),
+    ),
+    description = "Requires internal HMAC headers: X-Internal-Timestamp, X-Internal-Signature."
+)]
 pub async fn detect_image_url(
     State(service): State<Arc<ImageDetectionService>>,
     request: Result<Json<ImageUrlDetectRequest>, JsonRejection>,
@@ -63,6 +75,18 @@ pub async fn detect_image_url(
     ))
 }
 
+#[utoipa::path(
+    post, path = "/v1/images/detect-base64",
+    request_body = ImageBase64DetectRequest,
+    responses(
+        (status = 200, description = "Moderation verdict", body = ModerationModelOutput),
+        (status = 401, description = "Missing/invalid internal HMAC signature"),
+        (status = 422, description = "Validation error"),
+        (status = 502, description = "Model moderation failed"),
+        (status = 503, description = "GPU moderation not configured"),
+    ),
+    description = "Requires internal HMAC headers: X-Internal-Timestamp, X-Internal-Signature."
+)]
 pub async fn detect_image_base64(
     State(service): State<Arc<ImageDetectionService>>,
     request: Result<Json<ImageBase64DetectRequest>, JsonRejection>,
@@ -76,6 +100,18 @@ pub async fn detect_image_base64(
     ))
 }
 
+#[utoipa::path(
+    post, path = "/v1/text/detect",
+    request_body = TextDetectRequest,
+    responses(
+        (status = 200, description = "Moderation verdict", body = ModerationModelOutput),
+        (status = 401, description = "Missing/invalid internal HMAC signature"),
+        (status = 422, description = "Validation error"),
+        (status = 502, description = "Model moderation failed"),
+        (status = 503, description = "GPU moderation not configured"),
+    ),
+    description = "Requires internal HMAC headers: X-Internal-Timestamp, X-Internal-Signature."
+)]
 pub async fn detect_text(
     State(service): State<Arc<TextDetectionService>>,
     request: Result<Json<TextDetectRequest>, JsonRejection>,

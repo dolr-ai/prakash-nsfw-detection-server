@@ -15,13 +15,13 @@ pub struct ReadinessChecks {
     pub ffprobe: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct ReadinessDependency {
     name: String,
     ready: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct ReadinessResponse {
     status: String,
     dependencies: Vec<ReadinessDependency>,
@@ -32,6 +32,13 @@ pub async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({"status": "ok"}))
 }
 
+#[utoipa::path(
+    get, path = "/ready",
+    responses(
+        (status = 200, description = "All dependencies ready", body = ReadinessResponse),
+        (status = 503, description = "One or more dependencies not ready", body = ReadinessResponse),
+    )
+)]
 pub async fn ready(State(checks): State<ReadinessChecks>) -> (StatusCode, Json<ReadinessResponse>) {
     let dependencies = vec![
         ReadinessDependency {
