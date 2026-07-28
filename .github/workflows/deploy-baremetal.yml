@@ -97,9 +97,9 @@ jobs:
         with:
           url: https://vault.yral.com
           method: jwt
-          # Vault role bound to this repo (admin-created). Set as a repo Variable.
-          # Convention is <repo>-role (cf. yral-video-storage-service-role).
-          # Set the VAULT_ROLE repo variable only to override it.
+          # Vault role bound to this repo (admin-created in Vault). Defaults to the
+          # <repo>-role convention (cf. yral-video-storage-service-role); set the
+          # VAULT_ROLE repo variable only to override it.
           role: ${{ vars.VAULT_ROLE || 'prakash-nsfw-detection-server-role' }}
           jwtGithubAudience: ${{ vars.VAULT_JWT_AUDIENCE || 'https://github.com/dolr-ai' }}
           # Bearer token for the mixture-of-experts LLM endpoint -> API_KEY.
@@ -171,4 +171,4 @@ jobs:
           echo "**Status:** ${{ needs.deploy.result }}" >> "$GITHUB_STEP_SUMMARY"
           echo "**Image:** ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]'):${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
           echo "**Nodes:** server_1, server_2, server_3 (host port ${{ vars.HOST_APP_PORT || '3006' }} -> Caddy \`localhost:3006\`)" >> "$GITHUB_STEP_SUMMARY"
-          echo "**Public route:** add an \`nsfw.prakash.yral.com\` block to the shared infra Caddyfile (see deploy-baremetal/docker-compose.yml header)" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Public route:** add an \`moderation.prakash.yral.com\` block to the shared infra Caddyfile (see deploy-baremetal/docker-compose.yml header)" >> "$GITHUB_STEP_SUMMARY"
