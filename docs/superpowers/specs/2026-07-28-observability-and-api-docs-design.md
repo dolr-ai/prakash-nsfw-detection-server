@@ -77,9 +77,9 @@ Built with `tracing_subscriber::registry()` + layers:
    This is the linchpin of the content policy (§4): content only ever logs at `debug!`, so it can never reach Sentry, even with `RUST_LOG=debug`. No custom event filter is required; if the default ever changes, pin it explicitly.
 4. **Sentry panic hook** — installed by `sentry::init` (panic integration is a default feature). Captures panics (the `panic!("…")` verify test delivers an event).
 
-### `main` restructure (required)
+### `main` restructure (preferred)
 
-Sentry must be initialized **before** the tokio runtime starts (its guard + background transport thread), and settings (DSN, environment) must load first. Current `main` is `#[tokio::main]` with settings loaded inside async main — that ordering won't work.
+Sentry's default transport spawns its own background thread from `sentry::init`, so init *inside* `#[tokio::main]` does technically work. We still restructure to init observability **before** building the tokio runtime, because it's the idiomatic ordering: settings (DSN, environment) load first, the `ClientInitGuard` lifetime is anchored to `main`'s scope (guaranteeing a flush on exit), and no async task can run before the subscriber + panic hook are installed. Current `main` is `#[tokio::main]` with settings loaded inside async main.
 
 New shape:
 
@@ -110,20 +110,33 @@ Crate versions: `sentry = "0.32"` (as provided), `sentry-tracing` pinned to the 
 
 Every emit site, its level, and its fields.
 
-### A. Per-request span (`nsfw-api`, tower-http `TraceLayer`)
+### A. Per-request span (`nsfw-api`) — span ownership
 
-- span `http.request`, fields: `method`, `path`, `request_id`, `status`, `latency_ms`.
-- one `info!` on completion → breadcrumb. All deeper events inherit `request_id` from the span.
-- **Requires the request-id rework (§3.F).**
+**One span, owned by the request-id middleware, not `TraceLayer`.** `TraceLayer`'s `make_span` runs before our request-id middleware can populate the id, so a `TraceLayer` span cannot carry `request_id`. Instead: the request-id `from_fn` middleware (§3.F) generates/extracts the id, then opens a single `http.request` span (`tracing::info_span!`) entered for the downstream service. No `TraceLayer` — it would only duplicate this span. (`tower-http`'s `trace` feature is therefore **not** required; drop it from the earlier file list.)
 
-### B. GPU moderation (`nsfw-services`, all 3 methods)
+- span `http.request`, fields: `method`, `path`, `request_id` (set at open), `status`, `latency_ms` (recorded at close).
+- one `info!` on completion → breadcrumb. All deeper events, being emitted while this span is entered, inherit `request_id` (and `method`/`path`) via `sentry-tracing` span-context propagation — this is the mechanism §3.D relies on.
+
+### B. GPU moderation (`nsfw-services`, both stateless methods)
+
+The stateless service (`GpuModerationService`) exposes exactly two methods: `moderate_image_generation` and `moderate_text`. The `operation` field is therefore one of `image_generation` or `text` only. (`visual_batch` is the video/frame-pipeline path — a non-goal per §1 — and is **not reachable** here even though `moderate_image_generation` internally calls `parse_visual_batch_response(raw, 1)` for a single frame; don't confuse the parse helper with an in-scope operation.)
 
 Replaces Python's `_capture_model_attempt_failure`.
-- span `gpu.moderate` per call: fields `operation` (`visual_batch`/`image_generation`/`text`), `max_attempts`, and on completion `latency_ms`, `attempts_used`.
+- span `gpu.moderate` per call: fields `operation` (`image_generation`/`text`), `max_attempts`, and on completion `latency_ms`, `attempts_used`.
 - **failed non-final attempt** → `warn!` with `error_code`, `error_kind`, `retry_remaining=true`, `attempt` → breadcrumb.
 - **retries exhausted (give-up)** → `error!` with `error_code`, `error_kind`, `attempt`, `max_attempts` → Sentry event.
 - success → `info!` with `latency_ms`, `attempts_used`.
 - content (prompt/text) → `debug!` only, never in warn/error fields.
+
+**`error_code`/`error_kind` derivation:** `GpuModerationError` today carries no such fields; the instrumentation maps the variant to stable strings so Sentry issues group consistently:
+
+| `GpuModerationError` variant | `error_kind` | `error_code` |
+|---|---|---|
+| `Client(GpuClientError)` | `client` | inner client-error discriminant (e.g. `http_status`, `timeout`, `request`) |
+| `ModelOutput(ModelOutputError)` | `model_output` | inner parse-error discriminant (e.g. `invalid_json`, `schema`) |
+| `PromptNotConfigured(_)` | `config` | `prompt_not_configured` |
+
+The exact inner-discriminant strings are finalized during implementation against the `GpuClientError`/`ModelOutputError` variants; the mapping shape (variant → `{error_kind, error_code}`) is fixed here.
 
 **Improvement over Python (flagged, decided):** Python fires a Sentry *event* on every failed attempt including transient ones that recover. Here, per-attempt = breadcrumb, only the final give-up = event → one Sentry issue per genuine failure, full retry history preserved in the event's breadcrumb trail.
 
@@ -142,7 +155,7 @@ Replaces `app_error_handler` / `unhandled_error_handler`.
 - `4xx` → `debug!` (client errors, not alerts; matches Python not capturing sub-500).
 - panics → Sentry panic hook (§2).
 
-To get `method`/`path` into the error event, `ApiError::into_response` reads them from the current tracing span (set by the request span, §A) rather than taking them as parameters — keeps the `IntoResponse` signature unchanged.
+`method`/`path` reach the Sentry error event via **span-context propagation, not a span read-back API** (`tracing` has no public API to read a span's recorded fields). Because `into_response`'s `error!` fires while the `http.request` span (§A) is still entered, `sentry-tracing` automatically attaches that span's `method`/`path`/`request_id` to the event. `ApiError::into_response(self)` keeps its unchanged signature and only emits `error_code`/`http_status` as its own event fields; `method`/`path` come from the surrounding span. (Requires §A's single-span ownership so the span is guaranteed entered at this point.)
 
 ### E. Startup
 
@@ -162,11 +175,11 @@ The existing three request-id tests are updated; a new test asserts the id is pr
 
 | Python site | Rust target / level | Fields | Sentry |
 |---|---|---|---|
-| `_capture_model_attempt_failure` (non-final) | `gpu.moderate` / `warn!` | operation, error_code, error_kind, retry_remaining, attempt | breadcrumb |
+| `_capture_model_attempt_failure` (non-final) | `gpu.moderate` / `warn!` | operation (`image_generation`\|`text`), error_code, error_kind, retry_remaining, attempt | breadcrumb |
 | GPU give-up | `gpu.moderate` / `error!` | operation, error_code, error_kind, attempt, max_attempts | event |
 | `_capture_image_download_failure` (non-final) | `image.download` / `warn!` | error_kind, status_code, retry_remaining, url_* (redacted) | breadcrumb |
 | image give-up | `image.download` / `error!` | error_kind, url_* (redacted) | event |
-| `app_error_handler` (5xx) | `nsfw_api` / `error!` | error_code, http_status, method, path | event |
+| `app_error_handler` (5xx) | `error!` in `into_response` (own fields: error_code, http_status) + span context (method, path, request_id) | error_code, http_status | event |
 | `unhandled_error_handler` | panic hook + catch-all | — | event |
 
 ## 4. Redaction, content policy & secret safety
@@ -212,14 +225,14 @@ This is annotation-only — no behavior change, no new endpoints. Verified by a 
 
 - **New:** `crates/nsfw-observability/` (`init.rs`, `redact.rs`, `lib.rs`, tests).
 - **`nsfw-api/src/main.rs`:** drop `#[tokio::main]`; init observability before runtime; `info!` startup line; extend `#[openapi(...)]`.
-- **`nsfw-api/src/request_id.rs`:** generate id at entry, store in extension + span, echo on response.
-- **`nsfw-api/src/moderation_routes.rs`:** `#[utoipa::path]` + `ToSchema` derives + request-id span usage.
+- **`nsfw-api/src/request_id.rs`:** generate id at entry, store in extension, open the single `http.request` span (§3.A), echo id on response. This middleware owns the request span; no `TraceLayer`.
+- **`nsfw-api/src/moderation_routes.rs`:** `#[utoipa::path]` + `ToSchema` derives.
 - **`nsfw-api/src/image_detection.rs`:** `warn!`/`error!` on download failures with redacted URL; `debug!` raw URL; span with timing.
 - **`nsfw-api/src/error.rs`:** `error!` on 5xx (fields from span), `debug!` on 4xx.
 - **`nsfw-api/src/health.rs`:** `#[utoipa::path]` on `ready`; `ToSchema` on readiness types.
 - **`nsfw-services/src/gpu_moderation.rs`:** `warn!` per failed attempt, `error!` on give-up, `info!` + `latency_ms` on success; span per call; content at `debug!`.
 - **`nsfw-core/src/model_output.rs`:** add `utoipa::ToSchema` derive on `ModerationModelOutput`.
-- **`Cargo.toml`s:** `tracing` for nsfw-services/nsfw-api; `nsfw-observability` deps; `tower-http` (trace feature) for nsfw-api; `utoipa` schema features.
+- **`Cargo.toml`s:** `tracing` for nsfw-services/nsfw-api; `nsfw-observability` deps (sentry, sentry-tracing, tracing-subscriber); `utoipa` schema features. (No `tower-http` trace feature — the span is hand-rolled in `request_id.rs`.)
 
 ## 8. Open items
 
