@@ -139,7 +139,7 @@ mod tests {
     #[rstest]
     #[case("not a url")]
     #[case("")]
-    #[case("ftp:::::broken")]
+    #[case("//no-scheme")] // relative URL without base -> parse error
     fn unparseable_input_yields_empty_safe_url(#[case] input: &str) {
         assert_eq!(safe_url(input), SafeUrl::default());
     }
@@ -592,61 +592,68 @@ fn classify_error(err: &GpuModerationError) -> (&'static str, String) {
 }
 ```
 
-Add the import at the top: `use nsfw_clients::gpu::GpuClientError;` (already have `ImageInput`, extend the `use` line) and ensure `ModelOutputError` is imported from `nsfw_core` (extend the existing `use nsfw_core::{...}` line).
+Add the import at the top: extend `use nsfw_clients::gpu::{GpuClientError, GpuOpenAiClient, ImageInput};` and extend the existing `use nsfw_core::{...}` line to include `ModelOutputError`. Also add `use tracing::Instrument;`.
 
-Then, in **both** `moderate_image_generation` and `moderate_text`, wrap the retry loop in a span and add attempt/give-up logging. Concretely, replace the `for attempt in 1..=max_attempts { ... }` loop's `Err(err)` arm and add a span. For `moderate_text` (apply the parallel change to `moderate_image_generation`, using `operation = "image_generation"`):
+Then, in **both** `moderate_image_generation` and `moderate_text`, wrap the **retry loop in an instrumented async block** and add attempt/give-up logging.
 
-Wrap the loop body by creating a span before the loop:
+> **Why `.instrument()`, not `span.enter()`:** in an `async fn`, holding a `let _enter = span.enter()` guard across an `.await` is a correctness bug — the guard does not follow the task across suspension points, so events after the first `.await` land in the wrong span, and clippy flags `await_holding_span_guard`. The correct pattern is to attach the span to the future with `.instrument(span)`; every event emitted *inside* the future is then in the span automatically. Because this future already runs inside the `http.request` span (Task 4 instruments `next.run`), the new `gpu.moderate` span's parent is `http.request`, so `request_id` propagates.
+
+For `moderate_text`, restructure the method so the loop lives in an instrumented async block (apply the parallel change to `moderate_image_generation`, using `operation = "image_generation"`). Concretely, after computing `prompt` and `max_attempts`, replace the `let mut last_error ...; for attempt in ... { ... } Err(last_error...)` tail with:
 
 ```rust
         let span = tracing::info_span!("gpu.moderate", operation = "text", max_attempts);
-        let _enter = span.enter();
-        let start = std::time::Instant::now();
-```
-
-Change the `Ok(value) => return Ok(value),` arm to log success first:
-
-```rust
-                Ok(value) => {
-                    tracing::info!(
-                        attempts_used = attempt,
-                        latency_ms = start.elapsed().as_millis() as u64,
-                        "gpu moderation succeeded"
-                    );
-                    return Ok(value);
+        async move {
+            let start = std::time::Instant::now();
+            let mut last_error: Option<GpuModerationError> = None;
+            for attempt in 1..=max_attempts {
+                let _permit = self.semaphore.acquire().await.expect("semaphore not closed");
+                let attempt_result: Result<ModerationModelOutput, GpuModerationError> = async {
+                    let raw = self.client.moderate_text(&prompt, text).await?;
+                    Ok(parse_text_moderation_response(&raw)?)
                 }
-```
-
-Change the `Err(err)` arm to log per-attempt / give-up:
-
-```rust
-                Err(err) => {
-                    let (error_kind, error_code) = classify_error(&err);
-                    if attempt < max_attempts {
-                        tracing::warn!(
-                            operation = "text",
-                            error_kind,
-                            error_code = %error_code,
-                            attempt,
-                            retry_remaining = true,
-                            "gpu moderation attempt failed"
+                .await;
+                match attempt_result {
+                    Ok(value) => {
+                        tracing::info!(
+                            attempts_used = attempt,
+                            latency_ms = start.elapsed().as_millis() as u64,
+                            "gpu moderation succeeded"
                         );
-                    } else {
-                        tracing::error!(
-                            operation = "text",
-                            error_kind,
-                            error_code = %error_code,
-                            attempt,
-                            max_attempts,
-                            "gpu moderation failed after retries"
-                        );
+                        return Ok(value);
                     }
-                    last_error = Some(err);
-                    if attempt < max_attempts {
-                        sleep_before_retry(attempt, max_attempts, self.config.retry_base_delay_seconds).await;
+                    Err(err) => {
+                        let (error_kind, error_code) = classify_error(&err);
+                        if attempt < max_attempts {
+                            tracing::warn!(
+                                error_kind,
+                                error_code = %error_code,
+                                attempt,
+                                retry_remaining = true,
+                                "gpu moderation attempt failed"
+                            );
+                        } else {
+                            tracing::error!(
+                                error_kind,
+                                error_code = %error_code,
+                                attempt,
+                                max_attempts,
+                                "gpu moderation failed after retries"
+                            );
+                        }
+                        last_error = Some(err);
+                        if attempt < max_attempts {
+                            sleep_before_retry(attempt, max_attempts, self.config.retry_base_delay_seconds).await;
+                        }
                     }
                 }
+            }
+            Err(last_error.expect("loop always sets last_error before exiting"))
+        }
+        .instrument(span)
+        .await
 ```
+
+The `operation` (`text`/`image_generation`) is a field on the `gpu.moderate` span, so it's attached to every event inside without repeating it per-macro. The give-up `error!` still lists `max_attempts` explicitly so it's on the event itself (robust for the capture test, which asserts `max_attempts=3`).
 
 > Content note: the prompt/text is NEVER a field on these `warn!`/`error!`/`info!` events. If richer local debugging is ever wanted, add it only at `tracing::debug!` (sentry ignores DEBUG). Not required by this plan.
 
@@ -682,7 +689,7 @@ mod tests {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    async fn service(server_uri: &str) -> ImageDetectionService {
+    fn service() -> ImageDetectionService {
         // GPU not configured is fine — the download fails before GPU is reached.
         let settings = std::sync::Arc::new(
             Settings::from_map(&std::collections::HashMap::from([(
@@ -691,7 +698,6 @@ mod tests {
             )]))
             .unwrap(),
         );
-        let _ = server_uri;
         ImageDetectionService::new(settings, None, reqwest::Client::new())
     }
 
@@ -703,21 +709,21 @@ mod tests {
             .respond_with(ResponseTemplate::new(500))
             .mount(&server)
             .await;
-        let svc = service(&server.uri()).await;
+        let svc = service();
         let url = format!("{}/img.jpg?sig=TOPSECRET", server.uri());
 
         let result = svc.download_image_with_retries(&url).await;
         assert!(result.is_err());
 
         assert!(logs_contain("error_kind"));
-        assert!(logs_contain("url_host"));
+        assert!(logs_contain("url_host")); // redacted host is a field on the failure events
         // The signed-query credential must never be logged.
         assert!(!logs_contain("TOPSECRET"));
     }
 }
 ```
 
-> `download_image_with_retries` is currently private (`async fn`). Make it `pub(crate)` so the test module (same crate, but a child module can already see it — actually a child `mod tests` can call private methods). Keep it private; the test is an inner module of the same file and has access.
+> `download_image_with_retries` is a private `async fn`, but the `mod tests` above is a child module of the same file, so it can call the private method directly — no visibility change needed.
 
 - [ ] **Step 2: Run — fails (no url_host/error_kind in logs yet)**
 
@@ -726,11 +732,13 @@ Expected: FAIL.
 
 - [ ] **Step 3: Instrument `download_image_with_retries`**
 
-At the top of `image_detection.rs`, add `use nsfw_observability::safe_url;`.
+At the top of `image_detection.rs`, add `use nsfw_observability::safe_url;` and `use tracing::Instrument;`.
 
-Inside `download_image_with_retries`, compute the redacted URL once and open a span:
+Restructure `download_image_with_retries` so the loop runs inside an instrumented async block (same `.instrument()` rationale as Task 6 — never hold a `span.enter()` guard across the `.await`s in the loop). The redacted URL is computed once and put on both the span *and* the failure events (so the events carry `url_host` for correlation and the capture test can see it). Concretely:
 
 ```rust
+    async fn download_image_with_retries(&self, image_url: &str) -> Result<Vec<u8>, ApiError> {
+        let max_attempts = self.settings.image_download_max_attempts.max(1);
         let redacted = safe_url(image_url);
         let span = tracing::info_span!(
             "image.download",
@@ -740,35 +748,51 @@ Inside `download_image_with_retries`, compute the redacted URL once and open a s
             url_port = redacted.port,
             max_attempts,
         );
-        let _enter = span.enter();
-        tracing::debug!(image_url, "downloading image"); // raw URL only at debug
-```
+        async move {
+            tracing::debug!(image_url, "downloading image"); // raw URL only at debug
+            let mut last_error: Option<DownloadFailure> = None;
 
-In the loop, when a non-final attempt fails set an `error_kind` and `warn!`; when the loop exhausts, `error!` before building the returned error. Add a small helper mapping the `DownloadFailure` to a kind string. Concretely, add after the `match request.send()...` block, inside `if attempt < max_attempts { ... }`, a warn:
+            for attempt in 1..=max_attempts {
+                // ... unchanged request/send/match block that sets `last_error` or returns Ok ...
 
-```rust
-            if attempt < max_attempts {
-                if let Some(kind) = last_error.as_ref().map(download_kind) {
-                    tracing::warn!(error_kind = kind, attempt, retry_remaining = true, "image download attempt failed");
+                if attempt < max_attempts {
+                    if let Some(kind) = last_error.as_ref().map(download_kind) {
+                        tracing::warn!(
+                            error_kind = kind,
+                            url_host = %redacted.host,
+                            attempt,
+                            retry_remaining = true,
+                            "image download attempt failed"
+                        );
+                    }
+                    sleep_before_retry(
+                        attempt,
+                        max_attempts,
+                        self.settings.image_download_retry_base_delay_seconds,
+                    )
+                    .await;
                 }
-                sleep_before_retry(
-                    attempt,
-                    max_attempts,
-                    self.settings.image_download_retry_base_delay_seconds,
-                )
-                .await;
             }
-```
 
-And immediately before the final `Err(match last_error { ... })`, add:
+            if let Some(kind) = last_error.as_ref().map(download_kind) {
+                tracing::error!(
+                    error_kind = kind,
+                    url_host = %redacted.host,
+                    attempts = max_attempts,
+                    "image download failed after retries"
+                );
+            }
 
-```rust
-        if let Some(kind) = last_error.as_ref().map(download_kind) {
-            tracing::error!(error_kind = kind, attempts = max_attempts, "image download failed after retries");
+            Err(match last_error {
+                // ... unchanged mapping of DownloadFailure -> ApiError ...
+            })
         }
+        .instrument(span)
+        .await
+    }
 ```
 
-Add the helper near `sleep_before_retry`:
+Keep the existing request/send/`error_for_status()` match block and the final `DownloadFailure -> ApiError` mapping exactly as they are today — only the surrounding structure (span + async block + the two new log statements) changes. Add the helper near `sleep_before_retry`:
 
 ```rust
 fn download_kind(f: &DownloadFailure) -> &'static str {
@@ -780,7 +804,7 @@ fn download_kind(f: &DownloadFailure) -> &'static str {
 }
 ```
 
-> The non-retryable 4xx early-return path (line ~141) does not log an event — it's a client error, consistent with the 4xx→debug policy. Leave it as-is.
+> The non-retryable 4xx early-return path (`if status < 500 { return Err(...) }`) does not log a failure event — it's a client error, consistent with the 4xx→debug policy. Leave that early return as-is (it returns straight out of the async block).
 
 - [ ] **Step 4: Run the test + existing api tests**
 
