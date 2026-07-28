@@ -749,7 +749,9 @@ Restructure `download_image_with_retries` so the loop runs inside an instrumente
             max_attempts,
         );
         async move {
-            tracing::debug!(image_url, "downloading image"); // raw URL only at debug
+            // Redacted url_* fields come from the span. The raw URL is a signed credential,
+            // so it is never logged (safer than spec §3.C's debug-raw-url allowance).
+            tracing::debug!("downloading image");
             let mut last_error: Option<DownloadFailure> = None;
 
             for attempt in 1..=max_attempts {

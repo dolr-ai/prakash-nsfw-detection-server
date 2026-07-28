@@ -2,8 +2,10 @@ use base64::Engine;
 use nsfw_clients::gpu::ImageInput;
 use nsfw_config::Settings;
 use nsfw_core::{AppError, ErrorCode, ModerationModelOutput};
+use nsfw_observability::safe_url;
 use nsfw_services::gpu_moderation::GpuModerationService;
 use std::sync::Arc;
+use tracing::Instrument;
 
 use crate::error::ApiError;
 
@@ -115,66 +117,109 @@ impl ImageDetectionService {
 
     async fn download_image_with_retries(&self, image_url: &str) -> Result<Vec<u8>, ApiError> {
         let max_attempts = self.settings.image_download_max_attempts.max(1);
-        let mut last_error: Option<DownloadFailure> = None;
+        let redacted = safe_url(image_url);
+        let span = tracing::info_span!(
+            "image.download",
+            url_scheme = %redacted.scheme,
+            url_host = %redacted.host,
+            url_path = %redacted.path,
+            url_port = redacted.port,
+            max_attempts,
+        );
+        async move {
+            // Redacted url_* fields come from the enclosing span. The raw URL is a signed
+            // credential, so it is never logged (not even at debug) — safer than spec §3.C's
+            // debug-raw-url allowance, and loses only the query signature from journald.
+            tracing::debug!("downloading image");
+            let mut last_error: Option<DownloadFailure> = None;
 
-        for attempt in 1..=max_attempts {
-            let request =
-                self.http_client
-                    .get(image_url)
-                    .timeout(std::time::Duration::from_secs_f64(
-                        self.settings.image_download_timeout_seconds,
-                    ));
+            for attempt in 1..=max_attempts {
+                let request =
+                    self.http_client
+                        .get(image_url)
+                        .timeout(std::time::Duration::from_secs_f64(
+                            self.settings.image_download_timeout_seconds,
+                        ));
 
-            match request.send().await {
-                Ok(response) => match response.error_for_status() {
-                    Ok(response) => {
-                        return Ok(response
-                            .bytes()
-                            .await
-                            .map(|b| b.to_vec())
-                            .unwrap_or_default());
-                    }
-                    Err(err) => {
-                        let status = err.status().map(|s| s.as_u16()).unwrap_or(0);
-                        // 4xx is non-retryable and maps to a plain download failure,
-                        // exactly like Python's `status_code < 500` branch.
-                        if status < 500 {
-                            return Err(ApiError::from(AppError::new(
-                                ErrorCode::ImageDownloadFailed,
-                                "image_url could not be downloaded",
-                            )));
+                match request.send().await {
+                    Ok(response) => match response.error_for_status() {
+                        Ok(response) => {
+                            return Ok(response
+                                .bytes()
+                                .await
+                                .map(|b| b.to_vec())
+                                .unwrap_or_default());
                         }
-                        last_error = Some(DownloadFailure::HttpStatus);
+                        Err(err) => {
+                            let status = err.status().map(|s| s.as_u16()).unwrap_or(0);
+                            // 4xx is non-retryable and maps to a plain download failure,
+                            // exactly like Python's `status_code < 500` branch.
+                            if status < 500 {
+                                return Err(ApiError::from(AppError::new(
+                                    ErrorCode::ImageDownloadFailed,
+                                    "image_url could not be downloaded",
+                                )));
+                            }
+                            last_error = Some(DownloadFailure::HttpStatus);
+                        }
+                    },
+                    Err(err) if err.is_timeout() => last_error = Some(DownloadFailure::Timeout),
+                    Err(_) => last_error = Some(DownloadFailure::Request),
+                }
+
+                if attempt < max_attempts {
+                    if let Some(kind) = last_error.as_ref().map(download_kind) {
+                        tracing::warn!(
+                            error_kind = kind,
+                            url_host = %redacted.host,
+                            attempt,
+                            retry_remaining = true,
+                            "image download attempt failed"
+                        );
                     }
-                },
-                Err(err) if err.is_timeout() => last_error = Some(DownloadFailure::Timeout),
-                Err(_) => last_error = Some(DownloadFailure::Request),
+                    sleep_before_retry(
+                        attempt,
+                        max_attempts,
+                        self.settings.image_download_retry_base_delay_seconds,
+                    )
+                    .await;
+                }
             }
 
-            if attempt < max_attempts {
-                sleep_before_retry(
-                    attempt,
-                    max_attempts,
-                    self.settings.image_download_retry_base_delay_seconds,
-                )
-                .await;
+            if let Some(kind) = last_error.as_ref().map(download_kind) {
+                tracing::error!(
+                    error_kind = kind,
+                    url_host = %redacted.host,
+                    attempts = max_attempts,
+                    "image download failed after retries"
+                );
             }
+
+            Err(match last_error {
+                Some(DownloadFailure::Timeout) => ApiError::from(AppError::new(
+                    ErrorCode::ImageDownloadTimeout,
+                    "image_url download timed out",
+                )),
+                Some(DownloadFailure::HttpStatus) => ApiError::from(AppError::new(
+                    ErrorCode::ImageDownloadUpstreamError,
+                    "image_url host returned an upstream error",
+                )),
+                _ => ApiError::from(AppError::new(
+                    ErrorCode::ImageDownloadFailed,
+                    "image_url could not be downloaded",
+                )),
+            })
         }
+        .instrument(span)
+        .await
+    }
+}
 
-        Err(match last_error {
-            Some(DownloadFailure::Timeout) => ApiError::from(AppError::new(
-                ErrorCode::ImageDownloadTimeout,
-                "image_url download timed out",
-            )),
-            Some(DownloadFailure::HttpStatus) => ApiError::from(AppError::new(
-                ErrorCode::ImageDownloadUpstreamError,
-                "image_url host returned an upstream error",
-            )),
-            _ => ApiError::from(AppError::new(
-                ErrorCode::ImageDownloadFailed,
-                "image_url could not be downloaded",
-            )),
-        })
+fn download_kind(f: &DownloadFailure) -> &'static str {
+    match f {
+        DownloadFailure::Timeout => "timeout",
+        DownloadFailure::HttpStatus => "http_status",
+        DownloadFailure::Request => "request",
     }
 }
 
@@ -196,4 +241,45 @@ async fn sleep_before_retry(attempt: u32, max_attempts: u32, base_delay_seconds:
         (capped * jitter).max(0.0),
     ))
     .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nsfw_config::Settings;
+    use tracing_test::traced_test;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn service() -> ImageDetectionService {
+        // GPU not configured is fine — the download fails before GPU is reached.
+        let settings = std::sync::Arc::new(
+            Settings::from_map(&std::collections::HashMap::from([(
+                "IMAGE_DOWNLOAD_MAX_ATTEMPTS".to_string(),
+                "2".to_string(),
+            )]))
+            .unwrap(),
+        );
+        ImageDetectionService::new(settings, None, reqwest::Client::new())
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn logs_redacted_url_on_download_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let svc = service();
+        let url = format!("{}/img.jpg?sig=TOPSECRET", server.uri());
+
+        let result = svc.download_image_with_retries(&url).await;
+        assert!(result.is_err());
+
+        assert!(logs_contain("error_kind"));
+        assert!(logs_contain("url_host")); // redacted host is a field on the failure events
+        // The signed-query credential must never be logged.
+        assert!(!logs_contain("TOPSECRET"));
+    }
 }
