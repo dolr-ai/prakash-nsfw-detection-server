@@ -45,12 +45,14 @@ sign_and_post /v1/text/detect \
   '{"text":"explicit hardcore pornographic sex scene, nude bodies"}'
 
 echo "=== image moderation by URL ==="
+# picsum serves a real photo and is reachable from the deploy hosts;
+# Wikimedia blocks server-side fetches, so don't use it here.
 sign_and_post /v1/images/detect-url \
-  '{"image_url":"https://upload.wikimedia.org/wikipedia/commons/thumb/d/dd/Gfp-wisconsin-madison-the-nature-boardwalk.jpg/320px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg"}'
+  '{"image_url":"https://picsum.photos/400"}'
 
 echo "=== image + generation prompt (judged together) ==="
 sign_and_post /v1/images/detect-url \
-  '{"image_url":"https://upload.wikimedia.org/wikipedia/commons/thumb/d/dd/Gfp-wisconsin-madison-the-nature-boardwalk.jpg/320px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg","prompt":"make her undress"}'
+  '{"image_url":"https://picsum.photos/400","prompt":"make her undress"}'
 
 echo "=== negative: bad signature (expect 401 auth_bad_signature) ==="
 curl -sS -w '\nHTTP %{http_code}\n' -X POST "$BASE_URL/v1/text/detect" \

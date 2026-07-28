@@ -5,6 +5,7 @@ use nsfw_core::{
 };
 use std::sync::Arc;
 use tokio::sync::Semaphore;
+use tracing::Instrument;
 
 #[derive(Debug, Clone)]
 pub struct GpuModerationConfig {
@@ -74,38 +75,53 @@ impl GpuModerationService {
         };
 
         let max_attempts = self.config.max_attempts.max(1);
-        let mut last_error: Option<GpuModerationError> = None;
-        for attempt in 1..=max_attempts {
-            let _permit = self
-                .semaphore
-                .acquire()
-                .await
-                .expect("semaphore not closed");
-            let attempt_result: Result<ModerationModelOutput, GpuModerationError> = async {
-                let raw = self
-                    .client
-                    .moderate_images(&prompt, std::slice::from_ref(&image))
-                    .await?;
-                let mut parsed = parse_visual_batch_response(&raw, 1)?;
-                Ok(parsed.remove(0).base)
-            }
-            .await;
-            match attempt_result {
-                Ok(value) => return Ok(value),
-                Err(err) => {
-                    last_error = Some(err);
-                    if attempt < max_attempts {
-                        sleep_before_retry(
-                            attempt,
-                            max_attempts,
-                            self.config.retry_base_delay_seconds,
-                        )
-                        .await;
+        let span =
+            tracing::info_span!("gpu.moderate", operation = "image_generation", max_attempts);
+        async move {
+            let start = std::time::Instant::now();
+            let mut last_error: Option<GpuModerationError> = None;
+            for attempt in 1..=max_attempts {
+                let _permit = self
+                    .semaphore
+                    .acquire()
+                    .await
+                    .expect("semaphore not closed");
+                let attempt_result: Result<ModerationModelOutput, GpuModerationError> = async {
+                    let raw = self
+                        .client
+                        .moderate_images(&prompt, std::slice::from_ref(&image))
+                        .await?;
+                    let mut parsed = parse_visual_batch_response(&raw, 1)?;
+                    Ok(parsed.remove(0).base)
+                }
+                .await;
+                match attempt_result {
+                    Ok(value) => {
+                        tracing::info!(
+                            attempts_used = attempt,
+                            latency_ms = start.elapsed().as_millis() as u64,
+                            "gpu moderation succeeded"
+                        );
+                        return Ok(value);
+                    }
+                    Err(err) => {
+                        log_attempt_failure(&err, attempt, max_attempts);
+                        last_error = Some(err);
+                        if attempt < max_attempts {
+                            sleep_before_retry(
+                                attempt,
+                                max_attempts,
+                                self.config.retry_base_delay_seconds,
+                            )
+                            .await;
+                        }
                     }
                 }
             }
+            Err(last_error.expect("loop always sets last_error before exiting"))
         }
-        Err(last_error.expect("loop always sets last_error before exiting"))
+        .instrument(span)
+        .await
     }
 
     pub async fn moderate_text(
@@ -118,34 +134,101 @@ impl GpuModerationService {
             .ok_or(GpuModerationError::PromptNotConfigured("text"))?;
 
         let max_attempts = self.config.max_attempts.max(1);
-        let mut last_error: Option<GpuModerationError> = None;
-        for attempt in 1..=max_attempts {
-            let _permit = self
-                .semaphore
-                .acquire()
-                .await
-                .expect("semaphore not closed");
-            let attempt_result: Result<ModerationModelOutput, GpuModerationError> = async {
-                let raw = self.client.moderate_text(&prompt, text).await?;
-                Ok(parse_text_moderation_response(&raw)?)
-            }
-            .await;
-            match attempt_result {
-                Ok(value) => return Ok(value),
-                Err(err) => {
-                    last_error = Some(err);
-                    if attempt < max_attempts {
-                        sleep_before_retry(
-                            attempt,
-                            max_attempts,
-                            self.config.retry_base_delay_seconds,
-                        )
-                        .await;
+        let span = tracing::info_span!("gpu.moderate", operation = "text", max_attempts);
+        async move {
+            let start = std::time::Instant::now();
+            let mut last_error: Option<GpuModerationError> = None;
+            for attempt in 1..=max_attempts {
+                let _permit = self
+                    .semaphore
+                    .acquire()
+                    .await
+                    .expect("semaphore not closed");
+                let attempt_result: Result<ModerationModelOutput, GpuModerationError> = async {
+                    let raw = self.client.moderate_text(&prompt, text).await?;
+                    Ok(parse_text_moderation_response(&raw)?)
+                }
+                .await;
+                match attempt_result {
+                    Ok(value) => {
+                        tracing::info!(
+                            attempts_used = attempt,
+                            latency_ms = start.elapsed().as_millis() as u64,
+                            "gpu moderation succeeded"
+                        );
+                        return Ok(value);
+                    }
+                    Err(err) => {
+                        log_attempt_failure(&err, attempt, max_attempts);
+                        last_error = Some(err);
+                        if attempt < max_attempts {
+                            sleep_before_retry(
+                                attempt,
+                                max_attempts,
+                                self.config.retry_base_delay_seconds,
+                            )
+                            .await;
+                        }
                     }
                 }
             }
+            Err(last_error.expect("loop always sets last_error before exiting"))
         }
-        Err(last_error.expect("loop always sets last_error before exiting"))
+        .instrument(span)
+        .await
+    }
+}
+
+/// Maps an error to stable `(error_kind, error_code)` strings so Sentry groups issues
+/// consistently. Spec §3.B. No content, no secrets — variant/HTTP status only.
+fn classify_error(err: &GpuModerationError) -> (&'static str, String) {
+    match err {
+        GpuModerationError::Client(GpuClientError::Request(e)) => {
+            let code = if e.is_timeout() {
+                "timeout".to_string()
+            } else if let Some(status) = e.status() {
+                format!("http_{}", status.as_u16())
+            } else {
+                "request".to_string()
+            };
+            ("client", code)
+        }
+        GpuModerationError::Client(GpuClientError::MissingContent) => {
+            ("client", "missing_content".to_string())
+        }
+        GpuModerationError::ModelOutput(ModelOutputError::InvalidJson) => {
+            ("model_output", "invalid_json".to_string())
+        }
+        GpuModerationError::ModelOutput(ModelOutputError::InvalidSchema) => {
+            ("model_output", "invalid_schema".to_string())
+        }
+        GpuModerationError::PromptNotConfigured(_) => {
+            ("config", "prompt_not_configured".to_string())
+        }
+    }
+}
+
+/// A non-final attempt is a `warn!` (breadcrumb); the final give-up is an `error!`
+/// (Sentry event). `operation` is a field on the enclosing `gpu.moderate` span, so it is
+/// attached to every event without repeating it here. Content is never a field.
+fn log_attempt_failure(err: &GpuModerationError, attempt: u32, max_attempts: u32) {
+    let (error_kind, error_code) = classify_error(err);
+    if attempt < max_attempts {
+        tracing::warn!(
+            error_kind,
+            error_code = %error_code,
+            attempt,
+            retry_remaining = true,
+            "gpu moderation attempt failed"
+        );
+    } else {
+        tracing::error!(
+            error_kind,
+            error_code = %error_code,
+            attempt,
+            max_attempts,
+            "gpu moderation failed after retries"
+        );
     }
 }
 
@@ -177,6 +260,7 @@ fn append_generation_prompt(template: &str, generation_prompt: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+    use tracing_test::traced_test;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -244,6 +328,27 @@ mod tests {
             service.moderate_text("hello").await.unwrap().top_category,
             "safe"
         );
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn emits_warn_per_retry_and_error_on_giveup() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"message": {"content": "not json"}}]
+            })))
+            .mount(&server)
+            .await;
+        let service = service_with_mock(&server, 3).await;
+        assert!(service.moderate_text("hello").await.is_err());
+
+        // 2 non-final attempts -> warn; final give-up -> error.
+        assert!(logs_contain("error_kind=\"model_output\""));
+        assert!(logs_contain("retry_remaining=true"));
+        // give-up event names max_attempts
+        assert!(logs_contain("max_attempts=3"));
     }
 
     #[tokio::test]

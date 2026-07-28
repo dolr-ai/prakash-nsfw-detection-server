@@ -16,7 +16,7 @@ pub enum ModelOutputError {
 /// wire contract 1:1, and its `parse()` constructor already guarantees the
 /// self-consistency Python's `ModerationDetectResponse.validate_policy_fields` checks
 /// separately, so no redundant response DTO/validator is needed in the API layer.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct ModerationModelOutput {
     pub top_category: String,
     pub categories: HashMap<String, u8>,

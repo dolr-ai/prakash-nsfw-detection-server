@@ -7,9 +7,9 @@
 # `localhost:<port>`. Claimed: 3001 hello-world, 3002 estatedao, 3003
 # nofeebooking, 3004 storj-interface, 3005 storage-interface, 9000 sentry.
 # This service uses the next free port, 3006. To get a public hostname
-# (e.g. nsfw.prakash.yral.com) a Caddy block must be added to the shared infra
+# (e.g. moderation.prakash.yral.com) a Caddy block must be added to the shared infra
 # (`infra/Caddyfile.template` in yral-onboarding-hello-world-counter-prakash):
-#     nsfw.prakash.yral.com {
+#     moderation.prakash.yral.com {
 #     __TLS_DIRECTIVE__
 #         encode zstd gzip
 #         reverse_proxy localhost:3006

@@ -14,16 +14,31 @@ const IMAGE_TEXT_PROMPT: &str =
     include_str!("../prompts/image_prompt_generation_moderation_v1.txt");
 const TEXT_PROMPT: &str = include_str!("../prompts/text_moderation_v1.txt");
 
-#[derive(OpenApi)]
-#[openapi(paths(health::health))]
-struct ApiDoc;
-
-#[tokio::main]
-async fn main() {
+fn main() {
     // Load a local .env if present (no-op in prod where env vars come from compose/CI).
     let _ = dotenvy::dotenv();
     let settings = Arc::new(Settings::from_env().expect("failed to load settings"));
+
+    // Observability MUST be installed before the async runtime: settings (DSN,
+    // environment) load first, the guard lifetime is anchored to `main`, and the
+    // subscriber + panic hook are in place before any task runs. Held to end of main.
+    let _observability = nsfw_observability::init(&settings);
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime")
+        .block_on(serve(settings));
+}
+
+async fn serve(settings: Arc<Settings>) {
     let http_client = reqwest::Client::new();
+
+    tracing::info!(
+        environment = %settings.environment,
+        gpu_configured = settings.is_gpu_configured(),
+        "nsfw-api starting"
+    );
 
     let gpu_service: Option<Arc<GpuModerationService>> = if settings.is_gpu_configured() {
         let client = GpuOpenAiClient::new(
@@ -108,7 +123,7 @@ async fn main() {
         .route("/health", get(health::health))
         .route("/ready", get(health::ready).with_state(checks))
         .nest("/v1", v1_router)
-        .merge(SwaggerUi::new("/docs").url("/openapi.json", ApiDoc::openapi()))
+        .merge(SwaggerUi::new("/docs").url("/openapi.json", nsfw_api::api_doc::ApiDoc::openapi()))
         .fallback(fallback_404)
         .layer(axum::middleware::from_fn(request_id::request_id_middleware));
 
@@ -119,6 +134,7 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
         .await
         .expect("failed to bind");
+    tracing::info!(port, "listening");
     axum::serve(listener, app).await.expect("server error");
 }
 
